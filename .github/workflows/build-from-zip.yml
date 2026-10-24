@@ -1,0 +1,46 @@
+
+name: Build X360Browser
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        run: |
+          set -e
+          ZIP=$(find . -maxdepth 1 -iname "*.zip" -print -quit)
+          test -n "$ZIP" || { echo "ZIP nao encontrado"; exit 1; }
+          mkdir extracted
+          unzip -q "$ZIP" -d extracted
+          SRC=$(find extracted -maxdepth 5 -name CMakeLists.txt -print -quit)
+          test -n "$SRC" || { echo "CMakeLists.txt nao encontrado"; exit 1; }
+          echo "SRC_DIR=$(dirname "$SRC")" >> "$GITHUB_ENV"
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++
+
+      - name: Compile
+        run: |
+          cmake -S "$SRC_DIR" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2
+
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: X360Browser-build-results
+          path: |
+            build/
+            extracted/
+          if-no-files-found: warn
