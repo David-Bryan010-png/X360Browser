@@ -1,0 +1,131 @@
+name: Build X360Browser XEX
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "X360Browser-0.3.0.zip"
+      - ".github/workflows/build-xex-from-zip.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-xex:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            bison \
+            flex \
+            texinfo \
+            libgmp-dev \
+            libmpfr-dev \
+            libmpc-dev \
+            curl \
+            xz-utils \
+            patch \
+            python3 \
+            cmake \
+            ninja-build \
+            git \
+            ca-certificates \
+            unzip \
+            zip
+
+      - name: Extract original project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$GITHUB_WORKSPACE/X360Browser-0.3.0.zip"
+          SOURCE_ROOT="$RUNNER_TEMP/x360browser-source"
+
+          if [ ! -s "$ZIP" ]; then
+            echo "ERRO: ZIP original nao encontrado."
+            exit 1
+          fi
+
+          rm -rf "$SOURCE_ROOT"
+          mkdir -p "$SOURCE_ROOT"
+
+          unzip -q "$ZIP" -d "$SOURCE_ROOT"
+
+          PROJECT_DIR="$SOURCE_ROOT/X360Browser"
+
+          if [ ! -f "$PROJECT_DIR/tools/build_xbox_shell.sh" ]; then
+            echo "ERRO: script de compilacao Xbox nao encontrado."
+            find "$SOURCE_ROOT" -maxdepth 5 -type f | head -200
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/platform/xbox360/xsdk/main.c" ]; then
+            echo "ERRO: codigo nativo do Xbox nao encontrado."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Projeto original extraido corretamente."
+
+      - name: Build Xbox 360 executable
+        shell: bash
+        env:
+          JOBS: "4"
+          PREFIX: ${{ runner.temp }}/xsdk-gcc
+          WORK: ${{ runner.temp }}/xsdk-gcc-work
+          XSDK_DIR: ${{ runner.temp }}/xsdk
+          GLSLANG_DIR: ${{ runner.temp }}/glslang-xenon
+        run: |
+          set -euo pipefail
+
+          bash "$PROJECT_DIR/tools/build_xbox_shell.sh"
+
+      - name: Verify and package XEX
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          XEX="$PROJECT_DIR/build-xbox360/X360Browser.xex"
+
+          if [ ! -s "$XEX" ]; then
+            echo "ERRO: o arquivo XEX nao foi gerado."
+            find "$PROJECT_DIR" -type f \
+              \( -name '*.xex' -o -name '*.elf' \) -print
+            exit 1
+          fi
+
+          mkdir -p dist
+
+          cp "$XEX" dist/X360Browser.xex
+          cp "$PROJECT_DIR/platform/xbox360/xsdk/README.txt" \
+            dist/README.txt
+
+          (
+            cd dist
+            zip -q -j \
+              "$GITHUB_WORKSPACE/X360Browser-0.3.0-xbox-shell.zip" \
+              X360Browser.xex README.txt
+          )
+
+          echo "XEX gerado:"
+          ls -lh dist/X360Browser.xex
+          sha256sum dist/X360Browser.xex
+
+      - name: Upload Xbox executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: X360Browser-0.3.0-xbox-shell
+          path: X360Browser-0.3.0-xbox-shell.zip
+          if-no-files-found: error
+          retention-days: 14
