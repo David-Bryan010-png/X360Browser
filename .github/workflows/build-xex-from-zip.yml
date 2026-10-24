@@ -22,26 +22,12 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euo pipefail
-
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            bison \
-            flex \
-            texinfo \
-            libgmp-dev \
-            libmpfr-dev \
-            libmpc-dev \
-            curl \
-            xz-utils \
-            patch \
-            python3 \
-            cmake \
-            ninja-build \
-            git \
-            ca-certificates \
-            unzip \
-            zip
+            build-essential bison flex texinfo \
+            libgmp-dev libmpfr-dev libmpc-dev \
+            curl xz-utils patch python3 cmake \
+            ninja-build git ca-certificates unzip zip
 
       - name: Extract original project
         shell: bash
@@ -51,32 +37,57 @@ jobs:
           ZIP="$GITHUB_WORKSPACE/X360Browser-0.3.0.zip"
           SOURCE_ROOT="$RUNNER_TEMP/x360browser-source"
 
-          if [ ! -s "$ZIP" ]; then
+          test -s "$ZIP" || {
             echo "ERRO: ZIP original nao encontrado."
             exit 1
-          fi
+          }
 
           rm -rf "$SOURCE_ROOT"
           mkdir -p "$SOURCE_ROOT"
-
           unzip -q "$ZIP" -d "$SOURCE_ROOT"
 
           PROJECT_DIR="$SOURCE_ROOT/X360Browser"
 
-          if [ ! -f "$PROJECT_DIR/tools/build_xbox_shell.sh" ]; then
+          test -f "$PROJECT_DIR/tools/build_xbox_shell.sh" || {
             echo "ERRO: script de compilacao Xbox nao encontrado."
-            find "$SOURCE_ROOT" -maxdepth 5 -type f | head -200
             exit 1
-          fi
+          }
 
-          if [ ! -f "$PROJECT_DIR/platform/xbox360/xsdk/main.c" ]; then
+          test -f "$PROJECT_DIR/platform/xbox360/xsdk/main.c" || {
             echo "ERRO: codigo nativo do Xbox nao encontrado."
             exit 1
-          fi
+          }
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Projeto extraido corretamente."
 
-          echo "Projeto original extraido corretamente."
+      - name: Fix toolchain launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - "$PROJECT_DIR/tools/build_xbox_shell.sh" <<'PY'
+          from pathlib import Path
+          import sys
+
+          script = Path(sys.argv[1])
+          content = script.read_text(encoding="utf-8")
+
+          old = 'WORK="$WORK" JOBS="$JOBS" tools/toolchain/build.sh'
+          new = 'WORK="$WORK" JOBS="$JOBS" bash tools/toolchain/build.sh'
+
+          if new in content:
+              print("A chamada do toolchain ja esta corrigida.")
+          elif old in content:
+              content = content.replace(old, new, 1)
+              script.write_text(content, encoding="utf-8")
+              print("Correcao aplicada: toolchain executado via bash.")
+          else:
+              raise SystemExit(
+                  "ERRO: nao encontrei a chamada esperada "
+                  "ao script do toolchain."
+              )
+          PY
 
       - name: Build Xbox 360 executable
         shell: bash
@@ -88,7 +99,6 @@ jobs:
           GLSLANG_DIR: ${{ runner.temp }}/glslang-xenon
         run: |
           set -euo pipefail
-
           bash "$PROJECT_DIR/tools/build_xbox_shell.sh"
 
       - name: Verify and package XEX
@@ -106,7 +116,6 @@ jobs:
           fi
 
           mkdir -p dist
-
           cp "$XEX" dist/X360Browser.xex
           cp "$PROJECT_DIR/platform/xbox360/xsdk/README.txt" \
             dist/README.txt
