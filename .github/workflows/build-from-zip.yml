@@ -1,11 +1,11 @@
-
-name: Build X360Browser
+name: Build X360Browser Core
 
 on:
   workflow_dispatch:
   push:
     paths:
       - "*.zip"
+      - ".github/workflows/build-from-zip.yml"
 
 permissions:
   contents: read
@@ -13,34 +13,118 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-      - name: Extract ZIP
+      - name: Install build tools
         run: |
-          set -e
-          ZIP=$(find . -maxdepth 1 -iname "*.zip" -print -quit)
-          test -n "$ZIP" || { echo "ZIP nao encontrado"; exit 1; }
-          mkdir extracted
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake \
+            ninja-build \
+            g++ \
+            unzip
+
+      - name: Extract ZIP and locate main CMakeLists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p extracted
+
+          mapfile -t ZIP_FILES < <(
+            find . -maxdepth 1 -type f -iname '*.zip' -print | sort
+          )
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "ERRO: nenhum arquivo ZIP encontrado na raiz do repositorio."
+            exit 1
+          fi
+
+          if [ "${#ZIP_FILES[@]}" -gt 1 ]; then
+            echo "ERRO: existe mais de um ZIP na raiz."
+            echo "Deixe apenas o ZIP do projeto que deseja compilar."
+            printf '%s\n' "${ZIP_FILES[@]}"
+            exit 1
+          fi
+
+          ZIP="${ZIP_FILES[0]}"
+          echo "Arquivo selecionado: $ZIP"
+
           unzip -q "$ZIP" -d extracted
-          SRC=$(find extracted -maxdepth 5 -name CMakeLists.txt -print -quit)
-          test -n "$SRC" || { echo "CMakeLists.txt nao encontrado"; exit 1; }
-          echo "SRC_DIR=$(dirname "$SRC")" >> "$GITHUB_ENV"
 
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++
+          mapfile -t CMAKE_FILES < <(
+            grep -rl \
+              --include='CMakeLists.txt' \
+              'add_library(x360browser_core' \
+              extracted | sort || true
+          )
 
-      - name: Compile
+          if [ "${#CMAKE_FILES[@]}" -eq 0 ]; then
+            echo "ERRO: nao encontrei o CMakeLists.txt principal."
+            echo "CMakeLists.txt encontrados no ZIP:"
+            find extracted -type f -name CMakeLists.txt -print || true
+            exit 1
+          fi
+
+          SRC_CMAKE="${CMAKE_FILES[0]}"
+          SRC_DIR="$(dirname "$SRC_CMAKE")"
+
+          if [ ! -f "$SRC_DIR/src/url.cpp" ] || \
+             [ ! -d "$SRC_DIR/include" ]; then
+            echo "ERRO: a estrutura do projeto nao corresponde ao esperado."
+            echo "Diretorio encontrado: $SRC_DIR"
+            exit 1
+          fi
+
+          echo "CMake principal encontrado: $SRC_CMAKE"
+          echo "Diretorio do projeto: $SRC_DIR"
+
+          printf 'SRC_DIR=%s\n' "$SRC_DIR" >> "$GITHUB_ENV"
+
+      - name: Configure project
+        shell: bash
         run: |
-          cmake -S "$SRC_DIR" -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel 2
+          set -euo pipefail
 
-      - name: Save results
+          cmake \
+            -S "$SRC_DIR" \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DX360BROWSER_BUILD_DEMO=ON \
+            -DX360BROWSER_BUILD_TESTS=ON \
+            -DBUILD_TESTING=ON \
+            2>&1 | tee build-configure.log
+
+      - name: Compile project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake --build build --parallel 2 \
+            2>&1 | tee build-compile.log
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ctest --test-dir build --output-on-failure \
+            2>&1 | tee build-tests.log
+
+      - name: Save build results and logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: X360Browser-build-results
           path: |
             build/
-            extracted/
+            build-configure.log
+            build-compile.log
+            build-tests.log
           if-no-files-found: warn
+          retention-days: 7
