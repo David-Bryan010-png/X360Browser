@@ -1,60 +1,105 @@
-name: Build X360Browser Web Engine
+name: Build X360Browser 0.4.0 - Xbox 360 XEX
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
       - "X360Browser-0.4.0.zip"
-      - ".github/workflows/build-xbox-engine.yml"
+      - ".github/workflows/build-xex-from-zip.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: x360browser-xex-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  build-xbox-engine:
+  build-xbox360:
+    name: Build and package Xbox 360 XEX
     runs-on: ubuntu-24.04
     timeout-minutes: 240
 
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
-        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential bison flex texinfo \
-            libgmp-dev libmpfr-dev libmpc-dev \
-            curl xz-utils patch python3 cmake ninja-build \
-            git ca-certificates unzip zip
+            build-essential \
+            autoconf automake libtool pkg-config \
+            bison flex gawk gettext texinfo \
+            libgmp-dev libmpfr-dev libmpc-dev libncurses-dev \
+            curl ca-certificates git \
+            xz-utils bzip2 patch python3 cmake ninja-build \
+            unzip zip file
 
-      - name: Extract X360Browser 0.4.0 source
-        shell: bash
+      - name: Verify and extract source ZIP
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
           SOURCE_ZIP="$GITHUB_WORKSPACE/X360Browser-0.4.0.zip"
           SOURCE_ROOT="$RUNNER_TEMP/x360browser-source"
 
-          if [ ! -s "$SOURCE_ZIP" ]; then
-            echo "ERROR: X360Browser-0.4.0.zip was not found in the repository root."
+          if [[ ! -s "$SOURCE_ZIP" ]]; then
+            echo "ERROR: missing or empty file: $SOURCE_ZIP" >&2
             exit 1
           fi
+
+          echo "Checking ZIP integrity..."
+          unzip -tq "$SOURCE_ZIP"
 
           rm -rf "$SOURCE_ROOT"
           mkdir -p "$SOURCE_ROOT"
           unzip -q "$SOURCE_ZIP" -d "$SOURCE_ROOT"
 
-          PROJECT_DIR="$SOURCE_ROOT/X360Browser"
-          test -f "$PROJECT_DIR/tools/build_xbox_shell.sh"
-          test -f "$PROJECT_DIR/platform/xbox360/xsdk/web_engine.c"
-          test -f "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Source package verified."
+          # Locate the project without assuming the ZIP's folder name.
+          BUILD_SCRIPT="$(find "$SOURCE_ROOT" \
+            -type f \
+            -path '*/tools/build_xbox_shell.sh' \
+            -print -quit)"
 
-      - name: Build native Xbox 360 browser engine
-        shell: bash
+          if [[ -z "$BUILD_SCRIPT" ]]; then
+            echo "ERROR: tools/build_xbox_shell.sh was not found." >&2
+            find "$SOURCE_ROOT" -maxdepth 4 -type f |
+              head -200 >&2 || true
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$(dirname "$BUILD_SCRIPT")")"
+
+          REQUIRED_SOURCES=(
+            "$PROJECT_DIR/platform/xbox360/xsdk/web_engine.c"
+            "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
+          )
+
+          for file in "${REQUIRED_SOURCES[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "ERROR: required source missing: $file" >&2
+              exit 1
+            fi
+          done
+
+          SOURCE_ZIP_SHA256="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
+
+          printf 'PROJECT_DIR=%s\n' "$PROJECT_DIR" >> "$GITHUB_ENV"
+          printf 'SOURCE_ZIP_SHA256=%s\n' "$SOURCE_ZIP_SHA256" >> "$GITHUB_ENV"
+
+          echo "Source verified at: $PROJECT_DIR"
+          echo "Source ZIP SHA-256: $SOURCE_ZIP_SHA256"
+
+      - name: Build Xbox 360 browser
         env:
           JOBS: "4"
           PREFIX: ${{ runner.temp }}/xsdk-gcc
@@ -64,51 +109,89 @@ jobs:
           MBEDTLS_XENON_DIR: ${{ runner.temp }}/mbedtls-xenon
           CURL_XENON_DIR: ${{ runner.temp }}/curl-xenon
         run: |
-          set -euo pipefail
-          bash "$PROJECT_DIR/tools/build_xbox_shell.sh"
+          set -Eeuo pipefail
 
-      - name: Validate and package XEX plus HTTPS certificates
-        shell: bash
+          LOG_FILE="$RUNNER_TEMP/xbox-build.log"
+
+          echo "Building source directory: $PROJECT_DIR"
+
+          bash "$PROJECT_DIR/tools/build_xbox_shell.sh" \
+            2>&1 | tee "$LOG_FILE"
+
+      - name: Validate outputs and create release package
         run: |
-          set -euo pipefail
-          BUILD_DIR="$PROJECT_DIR/build-xbox360"
-          XEX="$BUILD_DIR/X360Browser.xex"
-          CA="$BUILD_DIR/cacert.pem"
+          set -Eeuo pipefail
 
-          for file in "$XEX" "$CA" "$BUILD_DIR/README.txt"; do
-            if [ ! -s "$file" ]; then
-              echo "ERROR: required output missing: $file"
+          BUILD_DIR="$PROJECT_DIR/build-xbox360"
+          DIST_DIR="$GITHUB_WORKSPACE/dist"
+          XEX="$BUILD_DIR/X360Browser.xex"
+          PACKAGE="$GITHUB_WORKSPACE/X360Browser-0.4.0-web-engine.zip"
+
+          REQUIRED_OUTPUTS=(
+            "$XEX"
+            "$BUILD_DIR/cacert.pem"
+            "$BUILD_DIR/README.txt"
+            "$BUILD_DIR/LICENSE-curl.txt"
+            "$BUILD_DIR/LICENSE-mbedTLS.txt"
+            "$BUILD_DIR/LICENSE-xsdk.txt"
+          )
+
+          for file in "${REQUIRED_OUTPUTS[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "ERROR: required output missing or empty: $file" >&2
               exit 1
             fi
           done
 
-          mkdir -p dist
-          cp "$XEX" dist/X360Browser.xex
-          cp "$CA" dist/cacert.pem
-          cp "$BUILD_DIR/README.txt" dist/README.txt
-          cp "$BUILD_DIR/LICENSE-curl.txt" dist/LICENSE-curl.txt
-          cp "$BUILD_DIR/LICENSE-mbedTLS.txt" dist/LICENSE-mbedTLS.txt
-          cp "$BUILD_DIR/LICENSE-xsdk.txt" dist/LICENSE-xsdk.txt
+          rm -rf "$DIST_DIR"
+          mkdir -p "$DIST_DIR"
+          cp -- "${REQUIRED_OUTPUTS[@]}" "$DIST_DIR/"
+
+          cat > "$DIST_DIR/BUILD-INFO.txt" <<EOF
+          X360Browser version: 0.4.0
+          Git commit: $GITHUB_SHA
+          Git ref: $GITHUB_REF
+          Source ZIP SHA-256: $SOURCE_ZIP_SHA256
+          Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+
+          rm -f "$PACKAGE"
 
           (
-            cd dist
-            zip -q -j \
-              "$GITHUB_WORKSPACE/X360Browser-0.4.0-web-engine.zip" \
-              X360Browser.xex cacert.pem README.txt \
-              LICENSE-curl.txt LICENSE-mbedTLS.txt LICENSE-xsdk.txt
+            cd "$DIST_DIR"
+            zip -9 -X -q -j "$PACKAGE" \
+              X360Browser.xex \
+              cacert.pem \
+              README.txt \
+              LICENSE-curl.txt \
+              LICENSE-mbedTLS.txt \
+              LICENSE-xsdk.txt \
+              BUILD-INFO.txt
           )
 
-          echo "XEX size:"
+          echo "--- XEX file ---"
+          file "$XEX"
           ls -lh "$XEX"
-          echo "SHA-256:"
-          sha256sum "$XEX"
-          echo "Package contents:"
-          unzip -l "$GITHUB_WORKSPACE/X360Browser-0.4.0-web-engine.zip"
 
-      - name: Upload browser engine artifact
+          echo "--- SHA-256 checksums ---"
+          sha256sum "$XEX" "$PACKAGE"
+
+          echo "--- Final package contents ---"
+          unzip -l "$PACKAGE"
+
+      - name: Upload XEX package
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360Browser-0.4.0-web-engine
           path: X360Browser-0.4.0-web-engine.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload build log for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: X360Browser-0.4.0-build-log
+          path: ${{ runner.temp }}/xbox-build.log
+          if-no-files-found: warn
+          retention-days: 7
