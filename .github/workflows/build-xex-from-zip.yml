@@ -1,130 +1,123 @@
-name: Build X360Browser 0.4.0 - Xbox 360 XEX
+name: Build X360Browser 2.2.0 XenonScript External dev
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "X360Browser-0.4.0.zip"
-      - ".github/workflows/build-xex-from-zip.yml"
+      - "CMakeLists.txt"
+      - "include/**"
+      - "src/**"
+      - "app/**"
+      - "engine/**"
+      - "platform/xbox360/**"
+      - "tools/build_xbox_shell.sh"
+      - "tests/**"
+      - "docs/**"
+      - "README.md"
+      - "VERSION"
+      - "CHANGELOG.md"
+      - "TEST-RESULTS.txt"
+      - "THIRD_PARTY_NOTICES.md"
+      - "X360Browser-video-config.example.txt"
+      - ".github/workflows/build-xbox-engine.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "CMakeLists.txt"
+      - "include/**"
+      - "src/**"
+      - "app/**"
+      - "engine/**"
+      - "platform/xbox360/**"
+      - "tools/build_xbox_shell.sh"
+      - "tests/**"
+      - "docs/**"
+      - "README.md"
+      - "VERSION"
+      - "CHANGELOG.md"
+      - "TEST-RESULTS.txt"
+      - "THIRD_PARTY_NOTICES.md"
+      - "X360Browser-video-config.example.txt"
+      - ".github/workflows/build-xbox-engine.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: x360browser-xex-${{ github.ref }}
+  group: x360browser-220-xenonscript-external-dev-build-${{ github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
-  build-xbox360:
-    name: Build and package Xbox 360 XEX
+  host-tests:
+    name: Host tests and compile-safety checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
-
     steps:
-      - name: Check out repository
+      - name: Check out source
         uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - name: Install host test dependencies
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libcurl4-openssl-dev python3
+      - name: Run HTML/network and VisualLite tests
+        run: python3 tests/run_host_tests.py
+      - name: Syntax-check Xbox UI, XenonWeb and layout adapter
+        run: |
+          set -Eeuo pipefail
+          gcc -std=c17 -Wall -Wextra -Wshadow -Wconversion -Werror \
+            -Itests/mock_xsdk -Iplatform/xbox360/xsdk -Iengine/xenonweb \
+            -fsyntax-only platform/xbox360/xsdk/main.c platform/xbox360/xsdk/visual_renderer.c \
+              platform/xbox360/xsdk/visual_layout.c engine/xenonweb/xw_dom.c \
+              engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c engine/xenonweb/xw_layout.c
+      - name: Syntax-check common raster decoder path
+        run: |
+          set -Eeuo pipefail
+          gcc -std=c17 -Wall -Wextra -Wshadow -Wconversion -Werror \
+            -DX360BROWSER_WITH_STB_IMAGE=1 \
+            -Itests/mock_xsdk -Iplatform/xbox360/xsdk \
+            -fsyntax-only platform/xbox360/xsdk/visual_renderer.c
+          bash -n tools/build_xbox_shell.sh
+      - name: Build and test portable C++ core
+        run: |
+          set -Eeuo pipefail
+          cmake -S . -B "$RUNNER_TEMP/x360browser-core-build" \
+            -DCMAKE_BUILD_TYPE=Release -DX360BROWSER_BUILD_TESTS=ON
+          cmake --build "$RUNNER_TEMP/x360browser-core-build" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/x360browser-core-build" --output-on-failure
 
-      - name: Install build dependencies
+  build-xbox360:
+    name: Cross-compile Xbox 360 XEX
+    needs: host-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install PowerPC build prerequisites
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            autoconf automake libtool pkg-config \
-            bison flex gawk gettext texinfo \
-            libgmp-dev libmpfr-dev libmpc-dev libncurses-dev \
-            curl ca-certificates git \
-            xz-utils bzip2 patch python3 cmake ninja-build \
-            unzip zip file
-
-      - name: Verify and extract source ZIP
+            build-essential autoconf automake libtool pkg-config bison flex gawk gettext texinfo \
+            libgmp-dev libmpfr-dev libmpc-dev libncurses-dev curl ca-certificates git \
+            xz-utils bzip2 patch python3 cmake ninja-build unzip zip file
+      - name: Validate checked-out source
         run: |
           set -Eeuo pipefail
-
-          SOURCE_ZIP="$GITHUB_WORKSPACE/X360Browser-0.4.0.zip"
-          SOURCE_ROOT="$RUNNER_TEMP/x360browser-source"
-
-          if [[ ! -s "$SOURCE_ZIP" ]]; then
-            echo "ERROR: missing or empty file: $SOURCE_ZIP" >&2
-            exit 1
-          fi
-
-          echo "Checking ZIP integrity..."
-          unzip -tq "$SOURCE_ZIP"
-
-          rm -rf "$SOURCE_ROOT"
-          mkdir -p "$SOURCE_ROOT"
-          unzip -q "$SOURCE_ZIP" -d "$SOURCE_ROOT"
-
-          # Find the build script instead of assuming the ZIP's top-level folder name.
-          BUILD_SCRIPT="$(find "$SOURCE_ROOT" -type f -path '*/tools/build_xbox_shell.sh' -print -quit)"
-          if [[ -z "$BUILD_SCRIPT" ]]; then
-            echo "ERROR: tools/build_xbox_shell.sh was not found in the ZIP." >&2
-            echo "Files found in archive:" >&2
-            find "$SOURCE_ROOT" -maxdepth 4 -type f | head -200 >&2 || true
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$(dirname "$BUILD_SCRIPT")")"
-          REQUIRED_SOURCES=(
-            "$PROJECT_DIR/platform/xbox360/xsdk/web_engine.c"
-            "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
-          )
-
-          for file in "${REQUIRED_SOURCES[@]}"; do
-            if [[ ! -s "$file" ]]; then
-              echo "ERROR: required source file missing: $file" >&2
-              exit 1
-            fi
-          done
-
-          SOURCE_ZIP_SHA256="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
-          printf 'PROJECT_DIR=%s\n' "$PROJECT_DIR" >> "$GITHUB_ENV"
-          printf 'SOURCE_ZIP_SHA256=%s\n' "$SOURCE_ZIP_SHA256" >> "$GITHUB_ENV"
-          echo "Source verified at: $PROJECT_DIR"
-          echo "Source ZIP SHA-256: $SOURCE_ZIP_SHA256"
-
-      - name: Prepare Mbed TLS framework submodule
-        shell: bash
-        env:
-          MBEDTLS_XENON_DIR: ${{ runner.temp }}/mbedtls-xenon
-        run: |
-          set -Eeuo pipefail
-
-          # mbedtls-xenon uses the framework git submodule. Without it,
-          # scripts/config.py cannot import mbedtls_framework and CMake fails.
-          git clone --depth 1 --branch xenon \
-            --recurse-submodules --shallow-submodules \
-            https://github.com/xenosworks/mbedtls-xenon.git \
-            "$MBEDTLS_XENON_DIR"
-
-          git -C "$MBEDTLS_XENON_DIR" submodule sync --recursive
-          git -C "$MBEDTLS_XENON_DIR" submodule update --init --recursive --depth 1
-
-          if [[ ! -s "$MBEDTLS_XENON_DIR/framework/CMakeLists.txt" ]]; then
-            echo "ERROR: Mbed TLS framework submodule was not populated." >&2
-            git -C "$MBEDTLS_XENON_DIR" submodule status --recursive >&2 || true
-            exit 1
-          fi
-
-          # Verify the Python package reported missing by the failed build.
-          if ! find "$MBEDTLS_XENON_DIR/framework" \
-              -type d -name mbedtls_framework -print -quit | grep -q .; then
-            echo "ERROR: mbedtls_framework Python package is still missing." >&2
-            exit 1
-          fi
-
-          echo "Mbed TLS framework submodule is ready."
-
-      - name: Build Xbox 360 browser
+          PROJECT_DIR="$GITHUB_WORKSPACE"
+          test -s "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
+          test -s "$PROJECT_DIR/platform/xbox360/xsdk/visual_layout.c"
+          test -s "$PROJECT_DIR/platform/xbox360/xsdk/visual_renderer.c"
+          test -s "$PROJECT_DIR/platform/xbox360/xsdk/netsurf_backend_stub.c"
+          test -s "$PROJECT_DIR/tools/build_xbox_shell.sh"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Build XEX and capture log
         env:
           JOBS: "4"
           PREFIX: ${{ runner.temp }}/xsdk-gcc
@@ -135,85 +128,66 @@ jobs:
           CURL_XENON_DIR: ${{ runner.temp }}/curl-xenon
         run: |
           set -Eeuo pipefail
-          LOG_FILE="$RUNNER_TEMP/xbox-build.log"
-          echo "Building source directory: $PROJECT_DIR"
-          bash "$PROJECT_DIR/tools/build_xbox_shell.sh" 2>&1 | tee "$LOG_FILE"
-
-      - name: Validate outputs and create release package
+          bash "$PROJECT_DIR/tools/build_xbox_shell.sh" 2>&1 | tee "$RUNNER_TEMP/xbox-build.log"
+      - name: Validate and package console XEX
         run: |
           set -Eeuo pipefail
-
           BUILD_DIR="$PROJECT_DIR/build-xbox360"
-          DIST_DIR="$GITHUB_WORKSPACE/dist"
-          XEX="$BUILD_DIR/X360Browser.xex"
-          PACKAGE="$GITHUB_WORKSPACE/X360Browser-0.4.0-web-engine.zip"
-
-          REQUIRED_OUTPUTS=(
-            "$XEX"
-            "$BUILD_DIR/cacert.pem"
-            "$BUILD_DIR/README.txt"
-            "$BUILD_DIR/LICENSE-curl.txt"
-            "$BUILD_DIR/LICENSE-mbedTLS.txt"
-            "$BUILD_DIR/LICENSE-xsdk.txt"
-          )
-
-          for file in "${REQUIRED_OUTPUTS[@]}"; do
-            if [[ ! -s "$file" ]]; then
-              echo "ERROR: required build output is missing or empty: $file" >&2
-              exit 1
-            fi
+          DIST="$RUNNER_TEMP/x360browser-220-xenonscript-external-dev-dist"
+          for item in X360Browser.xex cacert.pem README.txt LICENSE-curl.txt LICENSE-mbedTLS.txt LICENSE-xsdk.txt LICENSE-stb_image.txt; do
+            test -s "$BUILD_DIR/$item"
           done
-
-          rm -rf "$DIST_DIR"
-          mkdir -p "$DIST_DIR"
-          cp -- "${REQUIRED_OUTPUTS[@]}" "$DIST_DIR/"
-
-          cat > "$DIST_DIR/BUILD-INFO.txt" <<EOF
-          X360Browser version: 0.4.0
-          Git commit: $GITHUB_SHA
-          Git ref: $GITHUB_REF
-          Source ZIP SHA-256: $SOURCE_ZIP_SHA256
+          test -s "$PROJECT_DIR/X360Browser-video-config.example.txt"
+          rm -rf "$DIST"; mkdir -p "$DIST"
+          cp "$BUILD_DIR/X360Browser.xex" "$BUILD_DIR/cacert.pem" "$BUILD_DIR/README.txt" \
+             "$BUILD_DIR/LICENSE-curl.txt" "$BUILD_DIR/LICENSE-mbedTLS.txt" \
+             "$BUILD_DIR/LICENSE-xsdk.txt" "$BUILD_DIR/LICENSE-stb_image.txt" "$DIST/"
+          cp "$PROJECT_DIR/X360Browser-video-config.example.txt" "$DIST/"
+          cat > "$DIST/BUILD-INFO.txt" <<EOF_INFO
+          X360Browser version: 2.2.0-xenonscript-external-dev
+          Git commit: $SOURCE_COMMIT
+          Engine: first-party XenonWeb DOM/CSS/layout + bounded inline/external XenonScript subset
+          Supporting components: NativePlus HTTP/TLS transport; VisualLite layout fallback
+          Third-party page engine status: not linked; first-party XenonWeb is the visual engine
+          Full ECMAScript / event loop / Canvas / WebGL / WebAssembly: not supported; limited inline XenonScript subset is experimental
+          In-page video / modern web games / YouTube watch playback: not supported
+          Xbox validation: cross-build artifact only; physical-console testing still required
           Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          EOF
-
-          rm -f "$PACKAGE"
-          (
-            cd "$DIST_DIR"
-            zip -9 -X -q -j "$PACKAGE" \
-              X360Browser.xex \
-              cacert.pem \
-              README.txt \
-              LICENSE-curl.txt \
-              LICENSE-mbedTLS.txt \
-              LICENSE-xsdk.txt \
-              BUILD-INFO.txt
-          )
-
-          echo "--- XEX file ---"
-          file "$XEX"
-          ls -lh "$XEX"
-
-          echo "--- SHA-256 checksums ---"
-          sha256sum "$XEX" "$PACKAGE"
-
-          echo "--- Final package contents ---"
-          unzip -l "$PACKAGE"
-
-      # With archive:false, the downloaded artifact is the package ZIP itself,
-      # rather than another ZIP containing this ZIP.
-      - name: Upload XEX package
+          EOF_INFO
+          (cd "$DIST" && zip -9 -X -q -j "$GITHUB_WORKSPACE/X360Browser-2.2.0-xenonscript-external-dev-xbox.zip" ./*)
+          file "$BUILD_DIR/X360Browser.xex"
+          ls -lh "$BUILD_DIR/X360Browser.xex" "$GITHUB_WORKSPACE/X360Browser-2.2.0-xenonscript-external-dev-xbox.zip"
+          sha256sum "$BUILD_DIR/X360Browser.xex" "$GITHUB_WORKSPACE/X360Browser-2.2.0-xenonscript-external-dev-xbox.zip"
+      - name: Package the matching 2.2.0-xenonscript-external-dev source
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE"
+          rm -f X360Browser-2.2.0-xenonscript-external-dev.zip
+          zip -qr X360Browser-2.2.0-xenonscript-external-dev.zip . \
+            -x '.git/*' 'build-xbox360/*' 'X360Browser-0.8.0.zip' 'X360Browser-2.2.0-xenonscript-external-dev.zip' \
+               '*/__pycache__/*' '*/.pytest_cache/*'
+      - name: Upload XEX release package
+        if: success()
         uses: actions/upload-artifact@v7.0.2
         with:
-          path: X360Browser-0.4.0-web-engine.zip
-          archive: false
+          name: X360Browser-2.2.0-xenonscript-external-dev-xbox
+          path: X360Browser-2.2.0-xenonscript-external-dev-xbox.zip
           if-no-files-found: error
           retention-days: 14
-
-      - name: Upload build log for troubleshooting
+      - name: Upload source archive
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360Browser-0.4.0-build-log
+          name: X360Browser-2.2.0-xenonscript-external-dev-source
+          path: X360Browser-2.2.0-xenonscript-external-dev.zip
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload cross-build log
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: X360Browser-2.2.0-xenonscript-external-dev-build-log
           path: ${{ runner.temp }}/xbox-build.log
           if-no-files-found: warn
           retention-days: 7
