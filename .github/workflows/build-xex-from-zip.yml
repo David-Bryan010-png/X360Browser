@@ -64,21 +64,16 @@ jobs:
           mkdir -p "$SOURCE_ROOT"
           unzip -q "$SOURCE_ZIP" -d "$SOURCE_ROOT"
 
-          # Locate the project without assuming the ZIP's folder name.
-          BUILD_SCRIPT="$(find "$SOURCE_ROOT" \
-            -type f \
-            -path '*/tools/build_xbox_shell.sh' \
-            -print -quit)"
-
+          # Find the build script instead of assuming the ZIP's top-level folder name.
+          BUILD_SCRIPT="$(find "$SOURCE_ROOT" -type f -path '*/tools/build_xbox_shell.sh' -print -quit)"
           if [[ -z "$BUILD_SCRIPT" ]]; then
-            echo "ERROR: tools/build_xbox_shell.sh was not found." >&2
-            find "$SOURCE_ROOT" -maxdepth 4 -type f |
-              head -200 >&2 || true
+            echo "ERROR: tools/build_xbox_shell.sh was not found in the ZIP." >&2
+            echo "Files found in archive:" >&2
+            find "$SOURCE_ROOT" -maxdepth 4 -type f | head -200 >&2 || true
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$(dirname "$BUILD_SCRIPT")")"
-
           REQUIRED_SOURCES=(
             "$PROJECT_DIR/platform/xbox360/xsdk/web_engine.c"
             "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
@@ -86,18 +81,48 @@ jobs:
 
           for file in "${REQUIRED_SOURCES[@]}"; do
             if [[ ! -s "$file" ]]; then
-              echo "ERROR: required source missing: $file" >&2
+              echo "ERROR: required source file missing: $file" >&2
               exit 1
             fi
           done
 
           SOURCE_ZIP_SHA256="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
-
           printf 'PROJECT_DIR=%s\n' "$PROJECT_DIR" >> "$GITHUB_ENV"
           printf 'SOURCE_ZIP_SHA256=%s\n' "$SOURCE_ZIP_SHA256" >> "$GITHUB_ENV"
-
           echo "Source verified at: $PROJECT_DIR"
           echo "Source ZIP SHA-256: $SOURCE_ZIP_SHA256"
+
+      - name: Prepare Mbed TLS framework submodule
+        shell: bash
+        env:
+          MBEDTLS_XENON_DIR: ${{ runner.temp }}/mbedtls-xenon
+        run: |
+          set -Eeuo pipefail
+
+          # mbedtls-xenon uses the framework git submodule. Without it,
+          # scripts/config.py cannot import mbedtls_framework and CMake fails.
+          git clone --depth 1 --branch xenon \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/xenosworks/mbedtls-xenon.git \
+            "$MBEDTLS_XENON_DIR"
+
+          git -C "$MBEDTLS_XENON_DIR" submodule sync --recursive
+          git -C "$MBEDTLS_XENON_DIR" submodule update --init --recursive --depth 1
+
+          if [[ ! -s "$MBEDTLS_XENON_DIR/framework/CMakeLists.txt" ]]; then
+            echo "ERROR: Mbed TLS framework submodule was not populated." >&2
+            git -C "$MBEDTLS_XENON_DIR" submodule status --recursive >&2 || true
+            exit 1
+          fi
+
+          # Verify the Python package reported missing by the failed build.
+          if ! find "$MBEDTLS_XENON_DIR/framework" \
+              -type d -name mbedtls_framework -print -quit | grep -q .; then
+            echo "ERROR: mbedtls_framework Python package is still missing." >&2
+            exit 1
+          fi
+
+          echo "Mbed TLS framework submodule is ready."
 
       - name: Build Xbox 360 browser
         env:
@@ -110,13 +135,9 @@ jobs:
           CURL_XENON_DIR: ${{ runner.temp }}/curl-xenon
         run: |
           set -Eeuo pipefail
-
           LOG_FILE="$RUNNER_TEMP/xbox-build.log"
-
           echo "Building source directory: $PROJECT_DIR"
-
-          bash "$PROJECT_DIR/tools/build_xbox_shell.sh" \
-            2>&1 | tee "$LOG_FILE"
+          bash "$PROJECT_DIR/tools/build_xbox_shell.sh" 2>&1 | tee "$LOG_FILE"
 
       - name: Validate outputs and create release package
         run: |
@@ -138,7 +159,7 @@ jobs:
 
           for file in "${REQUIRED_OUTPUTS[@]}"; do
             if [[ ! -s "$file" ]]; then
-              echo "ERROR: required output missing or empty: $file" >&2
+              echo "ERROR: required build output is missing or empty: $file" >&2
               exit 1
             fi
           done
@@ -156,7 +177,6 @@ jobs:
           EOF
 
           rm -f "$PACKAGE"
-
           (
             cd "$DIST_DIR"
             zip -9 -X -q -j "$PACKAGE" \
@@ -179,6 +199,8 @@ jobs:
           echo "--- Final package contents ---"
           unzip -l "$PACKAGE"
 
+      # With archive:false, the downloaded artifact is the package ZIP itself,
+      # rather than another ZIP containing this ZIP.
       - name: Upload XEX package
         uses: actions/upload-artifact@v7.0.2
         with:
