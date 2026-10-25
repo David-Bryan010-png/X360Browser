@@ -1,95 +1,59 @@
-name: Build X360Browser XEX
+name: Build X360Browser Web Engine
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - "X360Browser-0.3.0.zip"
-      - ".github/workflows/build-xex-from-zip.yml"
+      - "X360Browser-0.4.0.zip"
+      - ".github/workflows/build-xbox-engine.yml"
 
 permissions:
   contents: read
 
 jobs:
-  build-xex:
+  build-xbox-engine:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7.0.1
 
       - name: Install build dependencies
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bison flex texinfo \
             libgmp-dev libmpfr-dev libmpc-dev \
-            curl xz-utils patch python3 cmake \
-            ninja-build git ca-certificates unzip zip
+            curl xz-utils patch python3 cmake ninja-build \
+            git ca-certificates unzip zip
 
-      - name: Extract original project
+      - name: Extract X360Browser 0.4.0 source
         shell: bash
         run: |
           set -euo pipefail
-
-          ZIP="$GITHUB_WORKSPACE/X360Browser-0.3.0.zip"
+          SOURCE_ZIP="$GITHUB_WORKSPACE/X360Browser-0.4.0.zip"
           SOURCE_ROOT="$RUNNER_TEMP/x360browser-source"
 
-          test -s "$ZIP" || {
-            echo "ERRO: ZIP original nao encontrado."
+          if [ ! -s "$SOURCE_ZIP" ]; then
+            echo "ERROR: X360Browser-0.4.0.zip was not found in the repository root."
             exit 1
-          }
+          fi
 
           rm -rf "$SOURCE_ROOT"
           mkdir -p "$SOURCE_ROOT"
-          unzip -q "$ZIP" -d "$SOURCE_ROOT"
+          unzip -q "$SOURCE_ZIP" -d "$SOURCE_ROOT"
 
           PROJECT_DIR="$SOURCE_ROOT/X360Browser"
-
-          test -f "$PROJECT_DIR/tools/build_xbox_shell.sh" || {
-            echo "ERRO: script de compilacao Xbox nao encontrado."
-            exit 1
-          }
-
-          test -f "$PROJECT_DIR/platform/xbox360/xsdk/main.c" || {
-            echo "ERRO: codigo nativo do Xbox nao encontrado."
-            exit 1
-          }
-
+          test -f "$PROJECT_DIR/tools/build_xbox_shell.sh"
+          test -f "$PROJECT_DIR/platform/xbox360/xsdk/web_engine.c"
+          test -f "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Projeto extraido corretamente."
+          echo "Source package verified."
 
-      - name: Fix toolchain launcher
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - "$PROJECT_DIR/tools/build_xbox_shell.sh" <<'PY'
-          from pathlib import Path
-          import sys
-
-          script = Path(sys.argv[1])
-          content = script.read_text(encoding="utf-8")
-
-          old = 'WORK="$WORK" JOBS="$JOBS" tools/toolchain/build.sh'
-          new = 'WORK="$WORK" JOBS="$JOBS" bash tools/toolchain/build.sh'
-
-          if new in content:
-              print("A chamada do toolchain ja esta corrigida.")
-          elif old in content:
-              content = content.replace(old, new, 1)
-              script.write_text(content, encoding="utf-8")
-              print("Correcao aplicada: toolchain executado via bash.")
-          else:
-              raise SystemExit(
-                  "ERRO: nao encontrei a chamada esperada "
-                  "ao script do toolchain."
-              )
-          PY
-
-      - name: Build Xbox 360 executable
+      - name: Build native Xbox 360 browser engine
         shell: bash
         env:
           JOBS: "4"
@@ -97,44 +61,54 @@ jobs:
           WORK: ${{ runner.temp }}/xsdk-gcc-work
           XSDK_DIR: ${{ runner.temp }}/xsdk
           GLSLANG_DIR: ${{ runner.temp }}/glslang-xenon
+          MBEDTLS_XENON_DIR: ${{ runner.temp }}/mbedtls-xenon
+          CURL_XENON_DIR: ${{ runner.temp }}/curl-xenon
         run: |
           set -euo pipefail
           bash "$PROJECT_DIR/tools/build_xbox_shell.sh"
 
-      - name: Verify and package XEX
+      - name: Validate and package XEX plus HTTPS certificates
         shell: bash
         run: |
           set -euo pipefail
+          BUILD_DIR="$PROJECT_DIR/build-xbox360"
+          XEX="$BUILD_DIR/X360Browser.xex"
+          CA="$BUILD_DIR/cacert.pem"
 
-          XEX="$PROJECT_DIR/build-xbox360/X360Browser.xex"
-
-          if [ ! -s "$XEX" ]; then
-            echo "ERRO: o arquivo XEX nao foi gerado."
-            find "$PROJECT_DIR" -type f \
-              \( -name '*.xex' -o -name '*.elf' \) -print
-            exit 1
-          fi
+          for file in "$XEX" "$CA" "$BUILD_DIR/README.txt"; do
+            if [ ! -s "$file" ]; then
+              echo "ERROR: required output missing: $file"
+              exit 1
+            fi
+          done
 
           mkdir -p dist
           cp "$XEX" dist/X360Browser.xex
-          cp "$PROJECT_DIR/platform/xbox360/xsdk/README.txt" \
-            dist/README.txt
+          cp "$CA" dist/cacert.pem
+          cp "$BUILD_DIR/README.txt" dist/README.txt
+          cp "$BUILD_DIR/LICENSE-curl.txt" dist/LICENSE-curl.txt
+          cp "$BUILD_DIR/LICENSE-mbedTLS.txt" dist/LICENSE-mbedTLS.txt
+          cp "$BUILD_DIR/LICENSE-xsdk.txt" dist/LICENSE-xsdk.txt
 
           (
             cd dist
             zip -q -j \
-              "$GITHUB_WORKSPACE/X360Browser-0.3.0-xbox-shell.zip" \
-              X360Browser.xex README.txt
+              "$GITHUB_WORKSPACE/X360Browser-0.4.0-web-engine.zip" \
+              X360Browser.xex cacert.pem README.txt \
+              LICENSE-curl.txt LICENSE-mbedTLS.txt LICENSE-xsdk.txt
           )
 
-          echo "XEX gerado:"
-          ls -lh dist/X360Browser.xex
-          sha256sum dist/X360Browser.xex
+          echo "XEX size:"
+          ls -lh "$XEX"
+          echo "SHA-256:"
+          sha256sum "$XEX"
+          echo "Package contents:"
+          unzip -l "$GITHUB_WORKSPACE/X360Browser-0.4.0-web-engine.zip"
 
-      - name: Upload Xbox executable
-        uses: actions/upload-artifact@v7
+      - name: Upload browser engine artifact
+        uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360Browser-0.3.0-xbox-shell
-          path: X360Browser-0.3.0-xbox-shell.zip
+          name: X360Browser-0.4.0-web-engine
+          path: X360Browser-0.4.0-web-engine.zip
           if-no-files-found: error
           retention-days: 14
