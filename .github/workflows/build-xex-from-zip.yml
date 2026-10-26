@@ -1,4 +1,4 @@
-name: Build X360Browser 2.2.0 XenonScript External dev
+name: Build X360Browser 2.3.0 Release Hardening
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ on:
       - "app/**"
       - "engine/**"
       - "platform/xbox360/**"
-      - "tools/build_xbox_shell.sh"
+      - "tools/**"
       - "tests/**"
       - "docs/**"
       - "README.md"
@@ -30,7 +30,7 @@ on:
       - "app/**"
       - "engine/**"
       - "platform/xbox360/**"
-      - "tools/build_xbox_shell.sh"
+      - "tools/**"
       - "tests/**"
       - "docs/**"
       - "README.md"
@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: x360browser-220-xenonscript-external-dev-build-${{ github.ref }}
+  group: x360browser-230-release-hardening-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -57,36 +57,245 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+
+      - name: Locate project root (also supports a nested ZIP directory)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PROJECT_DIR="$GITHUB_WORKSPACE"
+          if [[ ! -s "$PROJECT_DIR/platform/xbox360/xsdk/main.c" || ! -s "$PROJECT_DIR/CMakeLists.txt" ]]; then
+            MARKER="$(find "$GITHUB_WORKSPACE" -type f -path '*/platform/xbox360/xsdk/main.c' -not -path '*/.git/*' -print -quit || true)"
+            if [[ -n "$MARKER" ]]; then
+              PROJECT_DIR="$(cd "$(dirname "$MARKER")/../../.." && pwd)"
+            fi
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Resolved source root: $PROJECT_DIR"
+          if [[ ! -s "$PROJECT_DIR/CMakeLists.txt" || ! -s "$PROJECT_DIR/platform/xbox360/xsdk/main.c" ]]; then
+            echo "::error::Could not find the X360Browser source root. Upload the entire source ZIP contents to the repository, not only this workflow file."
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f | sort | head -200 || true
+            exit 2
+          fi
+
       - name: Install host test dependencies
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libcurl4-openssl-dev python3
+
+      - name: Restore host test runner if only the runner file was omitted
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -s "$PROJECT_DIR/tests/run_host_tests.py" ]]; then
+            required=(
+              tests/web_engine_fixture_server.py
+              tests/test_web_engine_native.c
+              tests/test_web_engine_dispatch.c
+              tests/test_visual_layout.c
+              tests/test_xenonweb.c
+              tests/test_xenonweb_layout.c
+              tests/test_xenonscript.c
+              platform/xbox360/xsdk/web_engine.c
+              engine/xenonweb/xw_dom.c
+              engine/xenonweb/xw_script.c
+            )
+            for item in "${required[@]}"; do
+              if [[ ! -s "$PROJECT_DIR/$item" ]]; then
+                echo "::error::Missing $item. The repository source is incomplete; replace it with the full X360Browser 2.3.0 source ZIP, not just the YAML."
+                exit 2
+              fi
+            done
+            mkdir -p "$PROJECT_DIR/tests"
+            cat > "$PROJECT_DIR/tests/run_host_tests.py" <<'PYTHON_FALLBACK'
+          #!/usr/bin/env python3
+          """Build and run the NativePlus and dispatcher tests against a local HTTP fixture."""
+          from __future__ import annotations
+          
+          import importlib.util
+          import os
+          import shlex
+          import subprocess
+          import tempfile
+          import threading
+          import time
+          from http.server import HTTPServer
+          from pathlib import Path
+          
+          ROOT = Path(os.environ.get("X360BROWSER_PROJECT_DIR", Path(__file__).resolve().parents[1])).resolve()
+          ENGINE = ROOT / "platform/xbox360/xsdk/web_engine.c"
+          DISPATCH = ROOT / "platform/xbox360/xsdk/web_engine_dispatch.c"
+          STUB = ROOT / "platform/xbox360/xsdk/netsurf_backend_stub.c"
+          
+          
+          def run(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
+              print("+", shlex.join(command), flush=True)
+              subprocess.run(command, cwd=cwd, env=env, check=True)
+          
+          
+          def main() -> int:
+              spec = importlib.util.spec_from_file_location("web_fixture", ROOT / "tests/web_engine_fixture_server.py")
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("Could not load test fixture server")
+              fixture = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(fixture)
+          
+              env = os.environ.copy()
+              env["NO_PROXY"] = "127.0.0.1,localhost"
+              env["no_proxy"] = env["NO_PROXY"]
+              env.pop("HTTP_PROXY", None)
+              env.pop("http_proxy", None)
+              env.pop("ALL_PROXY", None)
+              env.pop("all_proxy", None)
+          
+              cflags = shlex.split(subprocess.check_output(["pkg-config", "--cflags", "libcurl"], text=True))
+              libs = shlex.split(subprocess.check_output(["pkg-config", "--libs", "libcurl"], text=True))
+              compiler = shlex.split(env.get("CC", "cc"))
+              flags = ["-std=c17", "-O2", "-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"]
+          
+              with tempfile.TemporaryDirectory(prefix="x360browser-host-tests-") as temporary:
+                  temp = Path(temporary)
+                  native_test = temp / "test_web_engine_native"
+                  dispatch_test = temp / "test_web_engine_dispatch"
+                  visual_test = temp / "test_visual_layout_legacy"
+                  xenon_dom_test = temp / "test_xenonweb_dom_css"
+                  xenon_layout_test = temp / "test_xenonweb_layout"
+                  xenon_script_test = temp / "test_xenonscript"
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "platform/xbox360/xsdk"),
+                      str(ROOT / "tests/test_visual_layout.c"),
+                      str(ROOT / "platform/xbox360/xsdk/visual_layout.c"),
+                      "-o", str(visual_test)
+                  ])
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_xenonweb.c"),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"),
+                      str(ROOT / "engine/xenonweb/xw_css.c"),
+                      "-o", str(xenon_dom_test)
+                  ])
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "platform/xbox360/xsdk"),
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_xenonweb_layout.c"),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"),
+                      str(ROOT / "engine/xenonweb/xw_css.c"),
+                      str(ROOT / "engine/xenonweb/xw_script.c"),
+                      str(ROOT / "engine/xenonweb/xw_layout.c"),
+                      str(ROOT / "platform/xbox360/xsdk/visual_layout.c"),
+                      "-o", str(xenon_layout_test)
+                  ])
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_xenonscript.c"),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"),
+                      str(ROOT / "engine/xenonweb/xw_script.c"),
+                      "-o", str(xenon_script_test)
+                  ])
+                  run(compiler + flags + cflags + [
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_web_engine_native.c"), str(ENGINE),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"), str(ROOT / "engine/xenonweb/xw_script.c"),
+                      "-o", str(native_test)
+                  ] + libs)
+                  run(compiler + flags + cflags + [
+                      str(ROOT / "tests/test_web_engine_dispatch.c"), str(ENGINE), str(DISPATCH), str(STUB),
+                      "-o", str(dispatch_test)
+                  ] + libs)
+          
+                  server = HTTPServer(("127.0.0.1", 18765), fixture.Handler)
+                  server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                  server_thread.start()
+                  try:
+                      # Give the listener a small, deterministic opportunity to start.
+                      for _ in range(50):
+                          try:
+                              import urllib.request
+                              with urllib.request.urlopen("http://127.0.0.1:18765/page.html", timeout=0.2) as response:
+                                  if response.status == 200:
+                                      break
+                          except Exception:
+                              time.sleep(0.02)
+                      run([str(native_test)], cwd=temp, env=env)
+                      run([str(dispatch_test)], cwd=temp, env=env)
+                      run([str(visual_test)], cwd=temp, env=env)
+                      run([str(xenon_dom_test)], cwd=temp, env=env)
+                      run([str(xenon_layout_test)], cwd=temp, env=env)
+                      run([str(xenon_script_test)], cwd=temp, env=env)
+                  finally:
+                      server.shutdown()
+                      server.server_close()
+                      server_thread.join(timeout=1.0)
+          
+              print("PASS: all X360Browser XenonWeb + XenonScript host tests", flush=True)
+              return 0
+          
+          
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYTHON_FALLBACK
+            echo "::warning::tests/run_host_tests.py was missing; restored the runner from this workflow for this run. Commit the runner from the source ZIP to keep the repository consistent."
+          fi
+
+      - name: Check source-package integrity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -s "$PROJECT_DIR/tests/validate_project_integrity.py" ]]; then
+            X360BROWSER_PROJECT_DIR="$PROJECT_DIR" python3 "$PROJECT_DIR/tests/validate_project_integrity.py"
+          else
+            actual_version="$(tr -d '\r\n ' < "$PROJECT_DIR/VERSION" 2>/dev/null || true)"
+            if [[ "$actual_version" != "2.3.0-release-hardening" ]]; then
+              echo "::error::This checkout is version '$actual_version', not 2.3.0-release-hardening. Replace the repository files with the complete updated source ZIP; changing only the YAML is not enough."
+              exit 2
+            fi
+            echo "::warning::Project-integrity checker is absent; basic version check passed, but full source consistency was not checked. Use the complete source ZIP."
+          fi
+
       - name: Run HTML/network and VisualLite tests
-        run: python3 tests/run_host_tests.py
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          set -o pipefail
+          X360BROWSER_PROJECT_DIR="$PROJECT_DIR" python3 "$PROJECT_DIR/tests/run_host_tests.py" 2>&1 | tee "$RUNNER_TEMP/x360browser-host-test.log"
+
       - name: Syntax-check Xbox UI, XenonWeb and layout adapter
+        shell: bash
         run: |
           set -Eeuo pipefail
           gcc -std=c17 -Wall -Wextra -Wshadow -Wconversion -Werror \
-            -Itests/mock_xsdk -Iplatform/xbox360/xsdk -Iengine/xenonweb \
-            -fsyntax-only platform/xbox360/xsdk/main.c platform/xbox360/xsdk/visual_renderer.c \
-              platform/xbox360/xsdk/visual_layout.c engine/xenonweb/xw_dom.c \
-              engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c engine/xenonweb/xw_layout.c
-      - name: Syntax-check common raster decoder path
+            -I"$PROJECT_DIR/tests/mock_xsdk" -I"$PROJECT_DIR/platform/xbox360/xsdk" -I"$PROJECT_DIR/engine/xenonweb" \
+            -fsyntax-only "$PROJECT_DIR/platform/xbox360/xsdk/main.c" "$PROJECT_DIR/platform/xbox360/xsdk/visual_renderer.c" \
+              "$PROJECT_DIR/platform/xbox360/xsdk/visual_layout.c" "$PROJECT_DIR/engine/xenonweb/xw_dom.c" \
+              "$PROJECT_DIR/engine/xenonweb/xw_css.c" "$PROJECT_DIR/engine/xenonweb/xw_script.c" "$PROJECT_DIR/engine/xenonweb/xw_layout.c"
+
+      - name: Syntax-check common raster decoder path and build script
+        shell: bash
         run: |
           set -Eeuo pipefail
           gcc -std=c17 -Wall -Wextra -Wshadow -Wconversion -Werror \
             -DX360BROWSER_WITH_STB_IMAGE=1 \
-            -Itests/mock_xsdk -Iplatform/xbox360/xsdk \
-            -fsyntax-only platform/xbox360/xsdk/visual_renderer.c
-          bash -n tools/build_xbox_shell.sh
+            -I"$PROJECT_DIR/tests/mock_xsdk" -I"$PROJECT_DIR/platform/xbox360/xsdk" \
+            -fsyntax-only "$PROJECT_DIR/platform/xbox360/xsdk/visual_renderer.c"
+          bash -n "$PROJECT_DIR/tools/build_xbox_shell.sh"
+
       - name: Build and test portable C++ core
+        shell: bash
         run: |
           set -Eeuo pipefail
-          cmake -S . -B "$RUNNER_TEMP/x360browser-core-build" \
+          cmake -S "$PROJECT_DIR" -B "$RUNNER_TEMP/x360browser-core-build" \
             -DCMAKE_BUILD_TYPE=Release -DX360BROWSER_BUILD_TESTS=ON
           cmake --build "$RUNNER_TEMP/x360browser-core-build" --parallel 2
           ctest --test-dir "$RUNNER_TEMP/x360browser-core-build" --output-on-failure
+
+      - name: Upload host test log
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: X360Browser-2.3.0-release-hardening-host-test-log
+          path: ${{ runner.temp }}/x360browser-host-test.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   build-xbox360:
     name: Cross-compile Xbox 360 XEX
@@ -98,6 +307,187 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+
+      - name: Locate project root (also supports a nested ZIP directory)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PROJECT_DIR="$GITHUB_WORKSPACE"
+          if [[ ! -s "$PROJECT_DIR/platform/xbox360/xsdk/main.c" || ! -s "$PROJECT_DIR/CMakeLists.txt" ]]; then
+            MARKER="$(find "$GITHUB_WORKSPACE" -type f -path '*/platform/xbox360/xsdk/main.c' -not -path '*/.git/*' -print -quit || true)"
+            if [[ -n "$MARKER" ]]; then
+              PROJECT_DIR="$(cd "$(dirname "$MARKER")/../../.." && pwd)"
+            fi
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Resolved source root: $PROJECT_DIR"
+          for item in CMakeLists.txt VERSION tools/build_xbox_shell.sh platform/xbox360/xsdk/main.c; do
+            if [[ ! -s "$PROJECT_DIR/$item" ]]; then
+              echo "::error::Missing $item under the resolved project root."
+              exit 2
+            fi
+          done
+          actual_version="$(tr -d '\r\n ' < "$PROJECT_DIR/VERSION")"
+          if [[ "$actual_version" != "2.3.0-release-hardening" ]]; then
+            echo "::error::Wrong source version '$actual_version'. Replace the repository with the complete 2.3.0 source ZIP before requesting an XEX build."
+            exit 2
+          fi
+          echo "SOURCE_COMMIT=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Ensure source ZIP has the host-test runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -s "$PROJECT_DIR/tests/run_host_tests.py" ]]; then
+            required=(
+              tests/web_engine_fixture_server.py
+              tests/test_web_engine_native.c
+              tests/test_web_engine_dispatch.c
+              tests/test_visual_layout.c
+              tests/test_xenonweb.c
+              tests/test_xenonweb_layout.c
+              tests/test_xenonscript.c
+              platform/xbox360/xsdk/web_engine.c
+              engine/xenonweb/xw_dom.c
+              engine/xenonweb/xw_script.c
+            )
+            for item in "${required[@]}"; do
+              if [[ ! -s "$PROJECT_DIR/$item" ]]; then
+                echo "::error::Missing $item. The repository source is incomplete; replace it with the full X360Browser 2.3.0 source ZIP, not just the YAML."
+                exit 2
+              fi
+            done
+            mkdir -p "$PROJECT_DIR/tests"
+            cat > "$PROJECT_DIR/tests/run_host_tests.py" <<'PYTHON_FALLBACK'
+          #!/usr/bin/env python3
+          """Build and run the NativePlus and dispatcher tests against a local HTTP fixture."""
+          from __future__ import annotations
+          
+          import importlib.util
+          import os
+          import shlex
+          import subprocess
+          import tempfile
+          import threading
+          import time
+          from http.server import HTTPServer
+          from pathlib import Path
+          
+          ROOT = Path(os.environ.get("X360BROWSER_PROJECT_DIR", Path(__file__).resolve().parents[1])).resolve()
+          ENGINE = ROOT / "platform/xbox360/xsdk/web_engine.c"
+          DISPATCH = ROOT / "platform/xbox360/xsdk/web_engine_dispatch.c"
+          STUB = ROOT / "platform/xbox360/xsdk/netsurf_backend_stub.c"
+          
+          
+          def run(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
+              print("+", shlex.join(command), flush=True)
+              subprocess.run(command, cwd=cwd, env=env, check=True)
+          
+          
+          def main() -> int:
+              spec = importlib.util.spec_from_file_location("web_fixture", ROOT / "tests/web_engine_fixture_server.py")
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("Could not load test fixture server")
+              fixture = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(fixture)
+          
+              env = os.environ.copy()
+              env["NO_PROXY"] = "127.0.0.1,localhost"
+              env["no_proxy"] = env["NO_PROXY"]
+              env.pop("HTTP_PROXY", None)
+              env.pop("http_proxy", None)
+              env.pop("ALL_PROXY", None)
+              env.pop("all_proxy", None)
+          
+              cflags = shlex.split(subprocess.check_output(["pkg-config", "--cflags", "libcurl"], text=True))
+              libs = shlex.split(subprocess.check_output(["pkg-config", "--libs", "libcurl"], text=True))
+              compiler = shlex.split(env.get("CC", "cc"))
+              flags = ["-std=c17", "-O2", "-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"]
+          
+              with tempfile.TemporaryDirectory(prefix="x360browser-host-tests-") as temporary:
+                  temp = Path(temporary)
+                  native_test = temp / "test_web_engine_native"
+                  dispatch_test = temp / "test_web_engine_dispatch"
+                  visual_test = temp / "test_visual_layout_legacy"
+                  xenon_dom_test = temp / "test_xenonweb_dom_css"
+                  xenon_layout_test = temp / "test_xenonweb_layout"
+                  xenon_script_test = temp / "test_xenonscript"
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "platform/xbox360/xsdk"),
+                      str(ROOT / "tests/test_visual_layout.c"),
+                      str(ROOT / "platform/xbox360/xsdk/visual_layout.c"),
+                      "-o", str(visual_test)
+                  ])
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_xenonweb.c"),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"),
+                      str(ROOT / "engine/xenonweb/xw_css.c"),
+                      "-o", str(xenon_dom_test)
+                  ])
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "platform/xbox360/xsdk"),
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_xenonweb_layout.c"),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"),
+                      str(ROOT / "engine/xenonweb/xw_css.c"),
+                      str(ROOT / "engine/xenonweb/xw_script.c"),
+                      str(ROOT / "engine/xenonweb/xw_layout.c"),
+                      str(ROOT / "platform/xbox360/xsdk/visual_layout.c"),
+                      "-o", str(xenon_layout_test)
+                  ])
+                  run(compiler + flags + [
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_xenonscript.c"),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"),
+                      str(ROOT / "engine/xenonweb/xw_script.c"),
+                      "-o", str(xenon_script_test)
+                  ])
+                  run(compiler + flags + cflags + [
+                      "-I", str(ROOT / "engine/xenonweb"),
+                      str(ROOT / "tests/test_web_engine_native.c"), str(ENGINE),
+                      str(ROOT / "engine/xenonweb/xw_dom.c"), str(ROOT / "engine/xenonweb/xw_script.c"),
+                      "-o", str(native_test)
+                  ] + libs)
+                  run(compiler + flags + cflags + [
+                      str(ROOT / "tests/test_web_engine_dispatch.c"), str(ENGINE), str(DISPATCH), str(STUB),
+                      "-o", str(dispatch_test)
+                  ] + libs)
+          
+                  server = HTTPServer(("127.0.0.1", 18765), fixture.Handler)
+                  server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                  server_thread.start()
+                  try:
+                      # Give the listener a small, deterministic opportunity to start.
+                      for _ in range(50):
+                          try:
+                              import urllib.request
+                              with urllib.request.urlopen("http://127.0.0.1:18765/page.html", timeout=0.2) as response:
+                                  if response.status == 200:
+                                      break
+                          except Exception:
+                              time.sleep(0.02)
+                      run([str(native_test)], cwd=temp, env=env)
+                      run([str(dispatch_test)], cwd=temp, env=env)
+                      run([str(visual_test)], cwd=temp, env=env)
+                      run([str(xenon_dom_test)], cwd=temp, env=env)
+                      run([str(xenon_layout_test)], cwd=temp, env=env)
+                      run([str(xenon_script_test)], cwd=temp, env=env)
+                  finally:
+                      server.shutdown()
+                      server.server_close()
+                      server_thread.join(timeout=1.0)
+          
+              print("PASS: all X360Browser XenonWeb + XenonScript host tests", flush=True)
+              return 0
+          
+          
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYTHON_FALLBACK
+            echo "::warning::tests/run_host_tests.py was missing; restored the runner from this workflow for this run. Commit the runner from the source ZIP to keep the repository consistent."
+          fi
+
       - name: Install PowerPC build prerequisites
         run: |
           set -Eeuo pipefail
@@ -106,17 +496,18 @@ jobs:
             build-essential autoconf automake libtool pkg-config bison flex gawk gettext texinfo \
             libgmp-dev libmpfr-dev libmpc-dev libncurses-dev curl ca-certificates git \
             xz-utils bzip2 patch python3 cmake ninja-build unzip zip file
+
       - name: Validate checked-out source
+        shell: bash
         run: |
           set -Eeuo pipefail
-          PROJECT_DIR="$GITHUB_WORKSPACE"
-          test -s "$PROJECT_DIR/platform/xbox360/xsdk/main.c"
-          test -s "$PROJECT_DIR/platform/xbox360/xsdk/visual_layout.c"
-          test -s "$PROJECT_DIR/platform/xbox360/xsdk/visual_renderer.c"
-          test -s "$PROJECT_DIR/platform/xbox360/xsdk/netsurf_backend_stub.c"
-          test -s "$PROJECT_DIR/tools/build_xbox_shell.sh"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          for item in platform/xbox360/xsdk/main.c platform/xbox360/xsdk/visual_layout.c \
+                      platform/xbox360/xsdk/visual_renderer.c platform/xbox360/xsdk/netsurf_backend_stub.c \
+                      engine/xenonweb/xw_dom.c engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c \
+                      tests/run_host_tests.py tools/build_xbox_shell.sh; do
+            test -s "$PROJECT_DIR/$item"
+          done
+
       - name: Build XEX and capture log
         env:
           JOBS: "4"
@@ -126,14 +517,18 @@ jobs:
           GLSLANG_DIR: ${{ runner.temp }}/glslang-xenon
           MBEDTLS_XENON_DIR: ${{ runner.temp }}/mbedtls-xenon
           CURL_XENON_DIR: ${{ runner.temp }}/curl-xenon
+        shell: bash
         run: |
           set -Eeuo pipefail
+          set -o pipefail
           bash "$PROJECT_DIR/tools/build_xbox_shell.sh" 2>&1 | tee "$RUNNER_TEMP/xbox-build.log"
+
       - name: Validate and package console XEX
+        shell: bash
         run: |
           set -Eeuo pipefail
           BUILD_DIR="$PROJECT_DIR/build-xbox360"
-          DIST="$RUNNER_TEMP/x360browser-220-xenonscript-external-dev-dist"
+          DIST="$RUNNER_TEMP/x360browser-230-release-hardening-dist"
           for item in X360Browser.xex cacert.pem README.txt LICENSE-curl.txt LICENSE-mbedTLS.txt LICENSE-xsdk.txt LICENSE-stb_image.txt; do
             test -s "$BUILD_DIR/$item"
           done
@@ -144,50 +539,61 @@ jobs:
              "$BUILD_DIR/LICENSE-xsdk.txt" "$BUILD_DIR/LICENSE-stb_image.txt" "$DIST/"
           cp "$PROJECT_DIR/X360Browser-video-config.example.txt" "$DIST/"
           cat > "$DIST/BUILD-INFO.txt" <<EOF_INFO
-          X360Browser version: 2.2.0-xenonscript-external-dev
+          X360Browser version: 2.3.0-release-hardening
           Git commit: $SOURCE_COMMIT
           Engine: first-party XenonWeb DOM/CSS/layout + bounded inline/external XenonScript subset
           Supporting components: NativePlus HTTP/TLS transport; VisualLite layout fallback
           Third-party page engine status: not linked; first-party XenonWeb is the visual engine
-          Full ECMAScript / event loop / Canvas / WebGL / WebAssembly: not supported; limited inline XenonScript subset is experimental
+          Full ECMAScript / event loop / Canvas / WebGL / WebAssembly: not supported; XenonScript remains experimental
           In-page video / modern web games / YouTube watch playback: not supported
           Xbox validation: cross-build artifact only; physical-console testing still required
           Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           EOF_INFO
-          (cd "$DIST" && zip -9 -X -q -j "$GITHUB_WORKSPACE/X360Browser-2.2.0-xenonscript-external-dev-xbox.zip" ./*)
+          (cd "$DIST" && zip -9 -X -q -j "$GITHUB_WORKSPACE/X360Browser-2.3.0-release-hardening-xbox.zip" ./*)
           file "$BUILD_DIR/X360Browser.xex"
-          ls -lh "$BUILD_DIR/X360Browser.xex" "$GITHUB_WORKSPACE/X360Browser-2.2.0-xenonscript-external-dev-xbox.zip"
-          sha256sum "$BUILD_DIR/X360Browser.xex" "$GITHUB_WORKSPACE/X360Browser-2.2.0-xenonscript-external-dev-xbox.zip"
-      - name: Package the matching 2.2.0-xenonscript-external-dev source
+          ls -lh "$BUILD_DIR/X360Browser.xex" "$GITHUB_WORKSPACE/X360Browser-2.3.0-release-hardening-xbox.zip"
+          sha256sum "$BUILD_DIR/X360Browser.xex" "$GITHUB_WORKSPACE/X360Browser-2.3.0-release-hardening-xbox.zip"
+
+      - name: Package the matching 2.3.0 source ZIP
         if: always()
+        shell: bash
         run: |
           set -Eeuo pipefail
-          cd "$GITHUB_WORKSPACE"
-          rm -f X360Browser-2.2.0-xenonscript-external-dev.zip
-          zip -qr X360Browser-2.2.0-xenonscript-external-dev.zip . \
-            -x '.git/*' 'build-xbox360/*' 'X360Browser-0.8.0.zip' 'X360Browser-2.2.0-xenonscript-external-dev.zip' \
-               '*/__pycache__/*' '*/.pytest_cache/*'
+          if [[ -z "${PROJECT_DIR:-}" || ! -d "$PROJECT_DIR" ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          fi
+          SOURCE_ARCHIVE="$GITHUB_WORKSPACE/X360Browser-2.3.0-release-hardening.zip"
+          rm -f "$SOURCE_ARCHIVE"
+          (cd "$PROJECT_DIR" && zip -qr "$SOURCE_ARCHIVE" . \
+            -x '.git/*' 'build-xbox360/*' 'X360Browser-0.8.0.zip' \
+               'X360Browser-2.3.0-release-hardening.zip' 'X360Browser-2.3.0-release-hardening-xbox.zip' \
+               '*/__pycache__/*' '*/.pytest_cache/*')
+          test -s "$SOURCE_ARCHIVE"
+          ls -lh "$SOURCE_ARCHIVE"
+
       - name: Upload XEX release package
         if: success()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360Browser-2.2.0-xenonscript-external-dev-xbox
-          path: X360Browser-2.2.0-xenonscript-external-dev-xbox.zip
+          name: X360Browser-2.3.0-release-hardening-xbox
+          path: ${{ github.workspace }}/X360Browser-2.3.0-release-hardening-xbox.zip
           if-no-files-found: error
           retention-days: 14
+
       - name: Upload source archive
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360Browser-2.2.0-xenonscript-external-dev-source
-          path: X360Browser-2.2.0-xenonscript-external-dev.zip
+          name: X360Browser-2.3.0-release-hardening-source
+          path: ${{ github.workspace }}/X360Browser-2.3.0-release-hardening.zip
           if-no-files-found: warn
           retention-days: 14
+
       - name: Upload cross-build log
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360Browser-2.2.0-xenonscript-external-dev-build-log
+          name: X360Browser-2.3.0-release-hardening-build-log
           path: ${{ runner.temp }}/xbox-build.log
           if-no-files-found: warn
           retention-days: 7
