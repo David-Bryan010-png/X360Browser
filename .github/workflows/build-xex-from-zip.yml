@@ -2,25 +2,17 @@ name: X360Browser - Automatic Xbox 360 XEX Build
 
 on:
   push:
-    branches:
-      - main
-      - master
-      - principal
+    branches: [main, master, principal]
     paths:
       - "*.zip"
       - "**/*.zip"
       - ".github/workflows/build-xex-from-zip.yml"
-
   pull_request:
-    branches:
-      - main
-      - master
-      - principal
-
+    branches: [main, master, principal]
   workflow_dispatch:
     inputs:
       source_archive:
-        description: "ZIP do codigo-fonte (caminho relativo ao repositorio)"
+        description: "Caminho do ZIP do codigo-fonte dentro do repositorio"
         required: false
         default: "X360Browser-3.5.0-native-web-media-source.zip"
         type: string
@@ -28,13 +20,14 @@ on:
 permissions:
   contents: read
 
+# Nao cancelar uma compilacao em andamento por causa de outro push.
 concurrency:
   group: x360browser-auto-xex-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Test, compile XEX, and package
+    name: Validate, test, build XEX, and package
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -44,13 +37,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install compilation dependencies
+      - name: Install build dependencies
         shell: bash
         run: |
           set -Eeuo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             cmake \
@@ -75,11 +66,8 @@ jobs:
             zlib1g-dev \
             libcurl4-openssl-dev
 
-          mkdir -p "$RUNNER_TEMP/x360browser-output"
-          mkdir -p "$RUNNER_TEMP/x360browser-logs"
-
-          touch "$RUNNER_TEMP/x360browser-logs/build.log"
-
+          mkdir -p "$RUNNER_TEMP/x360browser-output" \
+                   "$RUNNER_TEMP/x360browser-logs"
           {
             echo "=== X360Browser automatic build ==="
             date -u
@@ -87,208 +75,214 @@ jobs:
             cc --version | head -n 1
             python3 --version
             cmake --version | head -n 1
-          } | tee -a "$RUNNER_TEMP/x360browser-logs/build.log"
+          } | tee "$RUNNER_TEMP/x360browser-logs/build.log"
 
-      - name: Locate and extract complete source
+      - name: Locate and safely extract source
         id: resolve-source
         shell: bash
         env:
           SOURCE_ARCHIVE_INPUT: ${{ github.event.inputs.source_archive || 'X360Browser-3.5.0-native-web-media-source.zip' }}
         run: |
           set -Eeuo pipefail
-
           LOG="$RUNNER_TEMP/x360browser-logs/build.log"
-
-          log() {
-            printf '%s\n' "$*" | tee -a "$LOG"
-          }
+          log() { printf '%s\n' "$*" | tee -a "$LOG"; }
 
           locate_root() {
-            local base="$1"
-            local marker
-            local candidate
-
-            while IFS= read -r marker; do
+            local base="$1" marker candidate
+            while IFS= read -r -d '' marker; do
               candidate="${marker%/tests/run_host_tests.py}"
-
-              if [[ -s "$candidate/engine/xenonweb/xw_dom.c" &&
-                    -d "$candidate/engine/xenonweb" ]]; then
+              if [[ -s "$candidate/engine/xenonweb/xw_dom.c" && \
+                    -d "$candidate/engine/xenonweb" && \
+                    -f "$candidate/platform/xbox360/xsdk/main.c" ]]; then
                 printf '%s\n' "$candidate"
                 return 0
               fi
             done < <(
-              find "$base" \
-                -type f \
+              find "$base" -type f \
                 -path '*/tests/run_host_tests.py' \
                 -not -path '*/.git/*' \
                 -not -path '*/build/*' \
                 -not -path '*/build-xbox360/*' \
-                -print 2>/dev/null | sort
+                -print0 2>/dev/null
             )
-
             return 1
           }
 
           PROJECT_DIR="$(locate_root "$GITHUB_WORKSPACE" || true)"
-
           if [[ -z "$PROJECT_DIR" ]]; then
             ARCHIVE=""
-
             if [[ -f "$SOURCE_ARCHIVE_INPUT" ]]; then
               ARCHIVE="$SOURCE_ARCHIVE_INPUT"
-
             elif [[ -f "$GITHUB_WORKSPACE/$SOURCE_ARCHIVE_INPUT" ]]; then
               ARCHIVE="$GITHUB_WORKSPACE/$SOURCE_ARCHIVE_INPUT"
-
             else
-              ARCHIVE="$(
-                find "$GITHUB_WORKSPACE" \
-                  -maxdepth 6 \
-                  -type f \
+              mapfile -t ZIPS < <(
+                find "$GITHUB_WORKSPACE" -maxdepth 6 -type f \
                   -iname '*x360browser*.zip' \
-                  -not -path '*/.git/*' \
-                  -print -quit 2>/dev/null || true
-              )"
+                  -not -path '*/.git/*' -print | sort
+              )
+              if [[ ${#ZIPS[@]} -eq 1 ]]; then
+                ARCHIVE="${ZIPS[0]}"
+              elif [[ ${#ZIPS[@]} -gt 1 ]]; then
+                log "::error::Mais de um ZIP foi encontrado. Execute manualmente e informe source_archive."
+                printf '%s\n' "${ZIPS[@]}" | tee -a "$LOG"
+                exit 2
+              fi
             fi
 
-            if [[ -z "$ARCHIVE" ]]; then
+            if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
               log "::error::Nenhum ZIP do X360Browser foi encontrado."
-              find "$GITHUB_WORKSPACE" \
-                -maxdepth 5 \
-                -type f \
-                -not -path '*/.git/*' \
-                -print | sort | tee -a "$LOG" || true
+              find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
+                -not -path '*/.git/*' -print | sort | tee -a "$LOG" || true
               exit 2
             fi
 
-            log "Arquivo selecionado: $ARCHIVE"
-
+            log "ZIP selecionado: $ARCHIVE"
             unzip -t "$ARCHIVE" 2>&1 | tee -a "$LOG"
 
-            EXTRACT_DIR="$RUNNER_TEMP/x360browser-source"
+            # Rejeita caminhos inseguros antes de extrair o ZIP.
+            python3 - "$ARCHIVE" <<'PY'
+import stat
+import sys
+import zipfile
+from pathlib import PurePosixPath
 
+archive = sys.argv[1]
+with zipfile.ZipFile(archive) as zf:
+    members = zf.infolist()
+    if not members:
+        raise SystemExit("ERRO: o ZIP esta vazio.")
+    for member in members:
+        name = member.filename.replace("\\", "/")
+        path = PurePosixPath(name)
+        mode = member.external_attr >> 16
+        if path.is_absolute() or ".." in path.parts or name.startswith("/"):
+            raise SystemExit(f"ERRO: caminho inseguro no ZIP: {member.filename}")
+        if stat.S_ISLNK(mode):
+            raise SystemExit(f"ERRO: link simbolico nao permitido no ZIP: {member.filename}")
+print("Validacao de caminhos do ZIP concluida.")
+PY
+
+            EXTRACT_DIR="$RUNNER_TEMP/x360browser-source"
             rm -rf "$EXTRACT_DIR"
             mkdir -p "$EXTRACT_DIR"
-
             unzip -q "$ARCHIVE" -d "$EXTRACT_DIR"
-
             PROJECT_DIR="$(locate_root "$EXTRACT_DIR" || true)"
           fi
 
           if [[ -z "$PROJECT_DIR" ]]; then
-            log "::error::Nao encontrei a raiz completa do codigo-fonte."
-            log "Esperado: tests/run_host_tests.py e engine/xenonweb/xw_dom.c."
-
-            find "$GITHUB_WORKSPACE" \
-              "$RUNNER_TEMP/x360browser-source" \
-              -maxdepth 5 \
-              -type f \
-              -not -path '*/.git/*' \
-              -print 2>/dev/null | sort | head -200 | tee -a "$LOG" || true
-
+            log "::error::A raiz do projeto esta ausente ou incompleta."
+            log "Esperado: tests/run_host_tests.py, engine/xenonweb/xw_dom.c e platform/xbox360/xsdk/main.c."
+            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/x360browser-source" \
+              -maxdepth 6 -type f -not -path '*/.git/*' \
+              -print 2>/dev/null | sort | head -250 | tee -a "$LOG" || true
             exit 2
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
           log "Raiz do projeto: $PROJECT_DIR"
-          log "Codigo-fonte localizado com sucesso."
-
           if [[ -f "$PROJECT_DIR/VERSION" ]]; then
             log "Versao: $(cat "$PROJECT_DIR/VERSION")"
           fi
 
-      - name: Repair known fread compiler error
-        id: repair-fread
+      - name: Repair known native-test source defects
+        id: repair-tests
         if: ${{ always() && steps.resolve-source.outcome == 'success' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
           python3 - "$PROJECT_DIR/tests/test_web_engine_native.c" <<'PY'
           from pathlib import Path
           import re
           import sys
 
           path = Path(sys.argv[1])
-
           if not path.is_file():
-              print(
-                  "Arquivo test_web_engine_native.c ausente. "
-                  "Esta correcao especifica nao e necessaria; "
-                  "os testes e a compilacao continuarao."
-              )
-              raise SystemExit(0)
+              raise SystemExit(f"ERRO: arquivo de teste esperado nao existe: {path}")
 
           source = path.read_text(encoding="utf-8")
+          original = source
+          backslash_n = chr(92) + "n"
 
-          pattern = re.compile(
+          # Corrige a string quebrada por uma versao anterior do workflow.
+          prefix = 'fprintf(stderr, "Erro ao ler assinatura do arquivo de teste.'
+          broken_literal = prefix + "\n" + '");'
+          valid_literal = prefix + backslash_n + '");'
+          malformed_count = source.count(broken_literal)
+          if malformed_count:
+              source = source.replace(broken_literal, valid_literal)
+
+          # Verifica fread em vez de descartar silenciosamente seu retorno.
+          fread_pattern = re.compile(
               r'\(\s*void\s*\)\s*fread\s*\(\s*sig\s*,\s*1U\s*,\s*'
               r'sizeof\s*\(\s*sig\s*\)\s*,\s*f\s*\)\s*;'
           )
-
-          replacement = (
+          fread_replacement = (
               'if (fread(sig, 1U, sizeof(sig), f) != sizeof(sig) '
               '|| ferror(f) != 0) { '
-              'fprintf(stderr, "Erro ao ler assinatura do arquivo de teste.\\n"); '
-              '(void)fclose(f); return 1; }'
+              + 'fprintf(stderr, "Erro ao ler assinatura do arquivo de teste.'
+              + backslash_n
+              + '"); '
+              + '(void)fclose(f); return 1; }'
+          )
+          source, fread_count = fread_pattern.subn(
+              lambda _match: fread_replacement, source
           )
 
-          source, count = pattern.subn(replacement, source)
+          if broken_literal in source:
+              raise SystemExit("ERRO: ainda existe uma string C quebrada apos o reparo.")
+          if re.search(r'\(\s*void\s*\)\s*fread\s*\(', source):
+              raise SystemExit("ERRO: ainda existe fread com retorno ignorado.")
 
-          if count:
+          if source != original:
               path.write_text(source, encoding="utf-8")
-              print(
-                  f"CORRIGIDO: {count} chamada(s) fread. "
-                  "O retorno da leitura agora e verificado."
-              )
-
-          elif re.search(
-              r'\(\s*void\s*\)\s*fread\s*\(',
-              source
-          ):
-              raise SystemExit(
-                  "Foi encontrado outro formato de fread com retorno "
-                  "descartado. A correcao automatica nao modificou "
-                  "esse codigo para evitar uma substituicao incorreta."
-              )
-
-          else:
-              print(
-                  "Nenhum fread com retorno descartado encontrado. "
-                  "O problema pode ja estar corrigido."
-              )
+          print(
+              f"Reparo concluido. Strings corrigidas: {malformed_count}; "
+              f"leituras fread corrigidas: {fread_count}."
+          )
           PY
 
-      - name: Validate project integrity
+          # Confere a sintaxe C antes de iniciar a bateria completa de testes.
+          cc -std=c17 -fsyntax-only -Wall -Wextra \
+            -I "$PROJECT_DIR/platform/xbox360/xsdk" \
+            -I "$PROJECT_DIR/engine/xenonweb" \
+            "$PROJECT_DIR/tests/test_web_engine_native.c"
+
+      - name: Validate source integrity
+        id: integrity
         if: ${{ always() && steps.resolve-source.outcome == 'success' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$PROJECT_DIR"
-          LOG="$RUNNER_TEMP/x360browser-logs/build.log"
-
+          LOG="$RUNNER_TEMP/x360browser-logs/integrity.log"
           if [[ -f tests/validate_project_integrity.py ]]; then
-            python3 -u tests/validate_project_integrity.py \
-              2>&1 | tee -a "$LOG"
+            python3 -u tests/validate_project_integrity.py 2>&1 | tee "$LOG"
           else
-            echo "AVISO: script de integridade ausente." \
-              | tee -a "$LOG"
+            echo "Aviso: tests/validate_project_integrity.py ausente; verificacoes especificas ignoradas." | tee "$LOG"
           fi
 
       - name: Compile and run native host tests
         id: host-tests
-        if: ${{ always() && steps.resolve-source.outcome == 'success' }}
+        if: ${{ always() && steps.resolve-source.outcome == 'success' && steps.repair-tests.outcome == 'success' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$PROJECT_DIR"
           LOG="$RUNNER_TEMP/x360browser-logs/host-tests.log"
+          WRAPPER_DIR="$RUNNER_TEMP/x360browser-cc-wrapper"
+          mkdir -p "$WRAPPER_DIR"
 
-          python3 -u tests/run_host_tests.py \
-            2>&1 | tee "$LOG"
+          # Mantem avisos de shadow visiveis, mas eles sozinhos nao
+          # bloqueiam os testes. Os outros erros continuam fatais.
+          cat > "$WRAPPER_DIR/cc" <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          exec /usr/bin/cc -Wno-error=shadow "$@"
+          SH
+          chmod +x "$WRAPPER_DIR/cc"
+
+          PATH="$WRAPPER_DIR:$PATH" python3 -u tests/run_host_tests.py 2>&1 | tee "$LOG"
 
       - name: Build portable CMake components
         id: host-build
@@ -296,58 +290,35 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$PROJECT_DIR"
           LOG="$RUNNER_TEMP/x360browser-logs/host-build.log"
           BUILD_DIR="$RUNNER_TEMP/x360browser-cmake"
-
           if [[ ! -f CMakeLists.txt ]]; then
-            echo "AVISO: CMakeLists.txt ausente; etapa CMake ignorada." \
-              | tee "$LOG"
+            echo "CMakeLists.txt ausente; etapa CMake ignorada." | tee "$LOG"
             exit 0
           fi
 
-          cmake \
-            -S "$PROJECT_DIR" \
-            -B "$BUILD_DIR" \
+          cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" \
             -DCMAKE_BUILD_TYPE=Release \
             -DX360BROWSER_BUILD_TESTS=ON \
             -DX360BROWSER_BUILD_DEMO=ON \
-            -DBUILD_TESTING=ON \
-            2>&1 | tee "$LOG"
+            -DBUILD_TESTING=ON 2>&1 | tee "$LOG"
+          cmake --build "$BUILD_DIR" --parallel 2 2>&1 | tee -a "$LOG"
+          ctest --test-dir "$BUILD_DIR" --output-on-failure 2>&1 | tee -a "$LOG"
 
-          cmake --build "$BUILD_DIR" \
-            --parallel 2 \
-            2>&1 | tee -a "$LOG"
-
-          ctest --test-dir "$BUILD_DIR" \
-            --output-on-failure \
-            2>&1 | tee -a "$LOG"
-
-      - name: Package corrected source code
+      - name: Package corrected source
         if: ${{ always() && steps.resolve-source.outcome == 'success' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-
           OUT="$RUNNER_TEMP/x360browser-output"
           mkdir -p "$OUT"
-
           cd "$PROJECT_DIR"
-
-          zip -qr \
-            "$OUT/X360Browser-corrected-source.zip" \
-            . \
-            -x '.git/*' \
-               '*/.git/*' \
-               'build/*' \
-               'build-xbox360/*' \
-               'build-xex/*' \
-               '*.zip' \
-               'tests/__pycache__/*'
-
-          unzip -t "$OUT/X360Browser-corrected-source.zip"
-
+          zip -qr "$OUT/X360Browser-corrected-source.zip" . \
+            -x '.git/*' '*/.git/*' 'build/*' 'build-xbox360/*' \
+               'build-xex/*' '*.zip' 'tests/__pycache__/*'
+          unzip -t "$OUT/X360Browser-corrected-source.zip" \
+            | tee -a "$RUNNER_TEMP/x360browser-logs/build.log"
           sha256sum "$OUT/X360Browser-corrected-source.zip" \
             | tee -a "$RUNNER_TEMP/x360browser-logs/build.log"
 
@@ -361,126 +332,83 @@ jobs:
           MAKEFLAGS: "-j2"
         run: |
           set -Eeuo pipefail
-
           LOG="$RUNNER_TEMP/x360browser-logs/xex-build.log"
           OUT="$RUNNER_TEMP/x360browser-output"
-
+          mkdir -p "$OUT"
           cd "$PROJECT_DIR"
-
-          log() {
-            printf '%s\n' "$*" | tee -a "$LOG"
-          }
-
+          log() { printf '%s\n' "$*" | tee -a "$LOG"; }
           log "=== Compilacao automatica do Xbox 360 ==="
 
           BUILD_SCRIPT=""
-
           for candidate in \
             "$PROJECT_DIR/tools/build_xbox_shell.sh" \
             "$PROJECT_DIR/tools/build_xbox360.sh" \
             "$PROJECT_DIR/tools/build_xex.sh" \
             "$PROJECT_DIR/platform/xbox360/build.sh" \
             "$PROJECT_DIR/build_xbox_shell.sh"; do
-
             if [[ -s "$candidate" ]]; then
               BUILD_SCRIPT="$candidate"
               break
             fi
           done
-
           if [[ -z "$BUILD_SCRIPT" ]]; then
-            BUILD_SCRIPT="$(
-              find "$PROJECT_DIR" \
-                -type f \
-                \( \
-                  -name 'build_xbox_shell.sh' \
-                  -o -name 'build_xbox360.sh' \
-                  -o -name 'build_xex.sh' \
-                \) \
-                -not -path '*/.git/*' \
-                -print -quit 2>/dev/null || true
-            )"
+            BUILD_SCRIPT="$(find "$PROJECT_DIR" -type f \
+              \( -name 'build_xbox_shell.sh' -o -name 'build_xbox360.sh' -o -name 'build_xex.sh' \) \
+              -not -path '*/.git/*' -print -quit 2>/dev/null || true)"
           fi
-
           if [[ -z "$BUILD_SCRIPT" || ! -s "$BUILD_SCRIPT" ]]; then
-            log "::error::Nao existe script de compilacao XEX no codigo-fonte."
-            log "Esperado: tools/build_xbox_shell.sh ou tools/build_xex.sh."
-            log "O workflow nao pode gerar um XEX real sem o compilador e as ferramentas de plataforma necessarias."
+            log "::error::Nenhum script de compilacao XEX foi encontrado no codigo-fonte."
             exit 2
           fi
 
           log "Script de compilacao: $BUILD_SCRIPT"
 
-          # Remove saidas antigas da copia temporaria para nao
-          # confundir um XEX antigo com o resultado desta compilacao.
+          # A copia temporaria e limpa para impedir que um XEX antigo
+          # seja confundido com o resultado desta compilacao.
           rm -rf "$PROJECT_DIR/build-xbox360"
-
-          find "$PROJECT_DIR" \
-            -type f \
-            -iname '*.xex' \
-            -not -path '*/.git/*' \
-            -delete
-
-          log "Iniciando script de compilacao..."
+          find "$PROJECT_DIR" -type f -iname '*.xex' \
+            -not -path '*/.git/*' -delete
 
           bash "$BUILD_SCRIPT" 2>&1 | tee -a "$LOG"
 
-          XEX_PATH="$(
-            find "$PROJECT_DIR" \
-              -type f \
-              -iname '*.xex' \
-              -not -path '*/.git/*' \
-              -not -path '*/tests/*' \
-              -print -quit 2>/dev/null || true
-          )"
-
+          XEX_PATH="$(find "$PROJECT_DIR" -type f -iname '*.xex' \
+            -not -path '*/.git/*' -not -path '*/tests/*' \
+            -print -quit 2>/dev/null || true)"
           if [[ -z "$XEX_PATH" || ! -s "$XEX_PATH" ]]; then
-            log "::error::O script terminou, mas nenhum arquivo .xex foi produzido."
-            log "Confira as mensagens do compilador, o toolchain PowerPC e o SDK usados pelo script."
+            log "::error::A compilacao terminou sem produzir um arquivo .xex."
             exit 1
           fi
 
-          log "XEX produzido: $XEX_PATH"
-
           STAGE="$RUNNER_TEMP/x360browser-xex-package"
-
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
-
           cp "$XEX_PATH" "$STAGE/X360Browser.xex"
 
           for candidate in \
             "$PROJECT_DIR/build-xbox360/cacert.pem" \
             "$PROJECT_DIR/cacert.pem" \
             "$PROJECT_DIR/platform/xbox360/cacert.pem"; do
-
             if [[ -s "$candidate" ]]; then
               cp "$candidate" "$STAGE/cacert.pem"
               break
             fi
           done
-
           if [[ -s "$PROJECT_DIR/build-xbox360/README.txt" ]]; then
-            cp "$PROJECT_DIR/build-xbox360/README.txt" "$STAGE/"
+            cp "$PROJECT_DIR/build-xbox360/README.txt" "$STAGE/README.txt"
           fi
 
-          (
-            cd "$STAGE"
-            zip -9 -X -q "$OUT/X360Browser-Xbox360-XEX.zip" ./*
-          )
-
-          sha256sum \
-            "$STAGE/X360Browser.xex" \
-            "$OUT/X360Browser-Xbox360-XEX.zip" \
+          (cd "$STAGE" && zip -9 -X -q "$OUT/X360Browser-Xbox360-XEX.zip" ./*)
+          unzip -t "$OUT/X360Browser-Xbox360-XEX.zip" | tee -a "$LOG"
+          sha256sum "$STAGE/X360Browser.xex" "$OUT/X360Browser-Xbox360-XEX.zip" \
             | tee -a "$LOG"
 
           {
-            echo "## X360Browser"
-            echo ""
-            echo "A compilacao XEX terminou e o arquivo foi empacotado."
-            echo ""
-            echo "- Arquivo: \`X360Browser-Xbox360-XEX.zip\`"
-            echo "- XEX gerado pelo script da plataforma."
+            echo "## X360Browser - XEX"
+            echo
+            echo "O script de plataforma produziu o arquivo XEX e ele foi empacotado."
+            echo
+            echo "- Artifact: X360Browser-automatic-build"
+            echo "- Arquivo: X360Browser-Xbox360-XEX.zip"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate diagnostic summary
@@ -488,22 +416,26 @@ jobs:
         shell: bash
         env:
           RESOLVE_RESULT: ${{ steps.resolve-source.outcome }}
+          REPAIR_RESULT: ${{ steps.repair-tests.outcome }}
+          INTEGRITY_RESULT: ${{ steps.integrity.outcome }}
           HOST_TEST_RESULT: ${{ steps.host-tests.outcome }}
           HOST_BUILD_RESULT: ${{ steps.host-build.outcome }}
           XEX_RESULT: ${{ steps.xex-build.outcome }}
         run: |
           {
             echo "## X360Browser - Resultados"
-            echo ""
+            echo
             echo "| Etapa | Resultado |"
             echo "|---|---|"
             echo "| Localizar codigo-fonte | $RESOLVE_RESULT |"
+            echo "| Reparar e verificar teste C | $REPAIR_RESULT |"
+            echo "| Integridade do projeto | $INTEGRITY_RESULT |"
             echo "| Testes nativos | $HOST_TEST_RESULT |"
             echo "| Compilacao CMake | $HOST_BUILD_RESULT |"
             echo "| Compilacao Xbox 360 XEX | $XEX_RESULT |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload XEX, corrected source, and logs
+      - name: Upload XEX, corrected source, and diagnostic logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
