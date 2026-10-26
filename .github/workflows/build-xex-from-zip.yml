@@ -140,28 +140,28 @@ jobs:
             log "ZIP selecionado: $ARCHIVE"
             unzip -t "$ARCHIVE" 2>&1 | tee -a "$LOG"
 
-            # Rejeita caminhos inseguros antes de extrair o ZIP.
+            # Rejeita caminhos absolutos, traversal e links simbolicos antes de extrair.
             python3 - "$ARCHIVE" <<'PY'
-import stat
-import sys
-import zipfile
-from pathlib import PurePosixPath
+          import stat
+          import sys
+          import zipfile
+          from pathlib import PurePosixPath
 
-archive = sys.argv[1]
-with zipfile.ZipFile(archive) as zf:
-    members = zf.infolist()
-    if not members:
-        raise SystemExit("ERRO: o ZIP esta vazio.")
-    for member in members:
-        name = member.filename.replace("\\", "/")
-        path = PurePosixPath(name)
-        mode = member.external_attr >> 16
-        if path.is_absolute() or ".." in path.parts or name.startswith("/"):
-            raise SystemExit(f"ERRO: caminho inseguro no ZIP: {member.filename}")
-        if stat.S_ISLNK(mode):
-            raise SystemExit(f"ERRO: link simbolico nao permitido no ZIP: {member.filename}")
-print("Validacao de caminhos do ZIP concluida.")
-PY
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as zf:
+              members = zf.infolist()
+              if not members:
+                  raise SystemExit("ERRO: o ZIP esta vazio.")
+              for member in members:
+                  name = member.filename.replace("\\", "/")
+                  path = PurePosixPath(name)
+                  mode = member.external_attr >> 16
+                  if path.is_absolute() or ".." in path.parts or name.startswith("/"):
+                      raise SystemExit(f"ERRO: caminho inseguro no ZIP: {member.filename}")
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"ERRO: link simbolico nao permitido no ZIP: {member.filename}")
+          print("Validacao de caminhos do ZIP concluida.")
+          PY
 
             EXTRACT_DIR="$RUNNER_TEMP/x360browser-source"
             rm -rf "$EXTRACT_DIR"
@@ -204,7 +204,7 @@ PY
           original = source
           backslash_n = chr(92) + "n"
 
-          # Corrige a string quebrada por uma versao anterior do workflow.
+          # Repara a string quebrada por uma versao anterior do workflow.
           prefix = 'fprintf(stderr, "Erro ao ler assinatura do arquivo de teste.'
           broken_literal = prefix + "\n" + '");'
           valid_literal = prefix + backslash_n + '");'
@@ -212,7 +212,7 @@ PY
           if malformed_count:
               source = source.replace(broken_literal, valid_literal)
 
-          # Verifica fread em vez de descartar silenciosamente seu retorno.
+          # Verifica fread; nao descarta silenciosamente o retorno de leitura.
           fread_pattern = re.compile(
               r'\(\s*void\s*\)\s*fread\s*\(\s*sig\s*,\s*1U\s*,\s*'
               r'sizeof\s*\(\s*sig\s*\)\s*,\s*f\s*\)\s*;'
@@ -242,7 +242,7 @@ PY
           )
           PY
 
-          # Confere a sintaxe C antes de iniciar a bateria completa de testes.
+          # Valida a sintaxe C deste teste antes de executar a bateria completa.
           cc -std=c17 -fsyntax-only -Wall -Wextra \
             -I "$PROJECT_DIR/platform/xbox360/xsdk" \
             -I "$PROJECT_DIR/engine/xenonweb" \
@@ -273,8 +273,8 @@ PY
           WRAPPER_DIR="$RUNNER_TEMP/x360browser-cc-wrapper"
           mkdir -p "$WRAPPER_DIR"
 
-          # Mantem avisos de shadow visiveis, mas eles sozinhos nao
-          # bloqueiam os testes. Os outros erros continuam fatais.
+          # Alguns testes antigos geram -Wshadow sob -Werror. Mantem o aviso,
+          # mas impede que somente esse aviso bloqueie os testes; outros erros continuam fatais.
           cat > "$WRAPPER_DIR/cc" <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
@@ -362,9 +362,7 @@ PY
           fi
 
           log "Script de compilacao: $BUILD_SCRIPT"
-
-          # A copia temporaria e limpa para impedir que um XEX antigo
-          # seja confundido com o resultado desta compilacao.
+          # A raiz aqui e uma copia temporaria; remover produtos antigos evita falso sucesso.
           rm -rf "$PROJECT_DIR/build-xbox360"
           find "$PROJECT_DIR" -type f -iname '*.xex' \
             -not -path '*/.git/*' -delete
