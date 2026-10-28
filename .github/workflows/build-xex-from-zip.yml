@@ -1,10 +1,10 @@
-name: X360Browser 4.2.0 — validate and build Xbox 360 XEX automatically
+name: X360Browser 4.3.0 — validate and build Xbox 360 XEX automatically
 
 on:
   workflow_dispatch:
     inputs:
       source_archive:
-        description: "Optional source ZIP path in the repository; blank auto-detects the checked-out 4.2.0 source tree or ZIP"
+        description: "Optional source ZIP path in the repository; blank auto-detects the checked-out 4.3.0 source tree or ZIP"
         required: false
         default: ""
         type: string
@@ -56,7 +56,7 @@ jobs:
             build-essential cmake ninja-build pkg-config libcurl4-openssl-dev \
             python3 unzip zip git curl ca-certificates
 
-      - name: Resolve exact 4.2.0 source tree
+      - name: Resolve exact 4.3.0 source tree
         id: source
         shell: bash
         env:
@@ -76,7 +76,7 @@ jobs:
                  -s "$candidate/tools/build_xbox_shell.sh" && \
                  -s "$candidate/platform/xbox360/xsdk/page.vert" ]] || continue
               version="$(tr -d '\r\n' < "$version_file")"
-              [[ "$version" == "4.2.0" ]] || continue
+              [[ "$version" == "4.3.0" ]] || continue
               printf '%s\n' "$candidate"
               return 0
             done < <(find "$base" -type f -name VERSION \
@@ -123,7 +123,7 @@ jobs:
             PROJECT_DIR="$(locate_root "$GITHUB_WORKSPACE" || true)"
             if [[ -z "$PROJECT_DIR" ]]; then
               ARCHIVE="$(find "$GITHUB_WORKSPACE" -maxdepth 6 -type f \
-                \( -iname 'X360Browser-4.2.0-source.zip' -o -iname '*x360browser*4.2.0*source*.zip' \) \
+                \( -iname 'X360Browser-4.3.0-source.zip' -o -iname '*x360browser*4.3.0*source*.zip' \) \
                 -not -path '*/.git/*' -print -quit || true)"
             fi
           fi
@@ -137,19 +137,19 @@ jobs:
           fi
 
           if [[ -z "$PROJECT_DIR" ]]; then
-            log "::error::Could not find the complete X360Browser 4.2.0 source tree or its source ZIP."
-            log "Commit the extracted source or add X360Browser-4.2.0-source.zip to the repository."
+            log "::error::Could not find the complete X360Browser 4.3.0 source tree or its source ZIP."
+            log "Commit the extracted source or add X360Browser-4.3.0-source.zip to the repository."
             find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -not -path '*/.git/*' -print | sort | head -180 | tee -a "$LOG" || true
             exit 2
           fi
 
           for required in \
             VERSION CMakeLists.txt README.md CHANGELOG.md \
-            tests/run_host_tests.py tests/validate_project_integrity.py tests/test_xbox_shader_contract.py \
+            tests/run_host_tests.py tests/validate_project_integrity.py tests/test_xbox_shader_contract.py tests/test_workflow_artifact_paths.py \
             tests/web_engine_fixture_server.py tests/test_web_engine_native.c \
             tests/test_web_engine_dispatch.c tests/test_youtube_compatibility.c \
             tests/test_xenonweb.c tests/test_xenonweb_layout.c tests/test_xenonscript.c tests/test_xenonmedia.c \
-            docs/COMPATIBILITY-4.2.0.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
+            docs/COMPATIBILITY-4.3.0.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
             platform/xbox360/xsdk/visual_renderer.c platform/xbox360/xsdk/main.c \
             platform/xbox360/xsdk/web_engine.c platform/xbox360/xsdk/CMakeLists.txt \
             engine/xenonweb/xw_dom.c engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c engine/xenonweb/xw_layout.c \
@@ -157,7 +157,7 @@ jobs:
             X360Browser-video-config.example.txt tools/build_xbox_shell.sh; do
             [[ -s "$PROJECT_DIR/$required" ]] || { log "::error::Missing required source: $required"; exit 2; }
           done
-          [[ "$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")" == "4.2.0" ]] || { log "::error::Source version mismatch"; exit 2; }
+          [[ "$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")" == "4.3.0" ]] || { log "::error::Source version mismatch"; exit 2; }
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           log "Source root: $PROJECT_DIR"
           log "Source version: $(cat "$PROJECT_DIR/VERSION")"
@@ -169,7 +169,8 @@ jobs:
           cd "$PROJECT_DIR"
           python3 tests/validate_project_integrity.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
           python3 tests/test_xbox_shader_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 -m py_compile tests/run_host_tests.py tests/validate_project_integrity.py tests/web_engine_fixture_server.py
+          python3 tests/test_workflow_artifact_paths.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
+          python3 -m py_compile tests/run_host_tests.py tests/validate_project_integrity.py tests/web_engine_fixture_server.py tests/test_workflow_artifact_paths.py
           bash -n tools/build_xbox_shell.sh
 
       - name: Run XenonWeb, XenonScript, XenonMedia, transport and URL regressions
@@ -211,20 +212,29 @@ jobs:
           set -Eeuo pipefail
           DIST="$RUNNER_TEMP/x360browser-dist"
           mkdir -p "$DIST"
-          (cd "$PROJECT_DIR" && zip -qr "$DIST/X360Browser-4.2.0-source.zip" . \
+          (cd "$PROJECT_DIR" && zip -qr "$DIST/X360Browser-4.3.0-source.zip" . \
             -x '.git/*' 'build/*' 'build-xbox360/*' '*.zip' 'tests/__pycache__/*')
-          unzip -t "$DIST/X360Browser-4.2.0-source.zip" | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          (cd "$DIST" && sha256sum X360Browser-4.2.0-source.zip > X360Browser-4.2.0-source.zip.sha256)
+          unzip -t "$DIST/X360Browser-4.3.0-source.zip" | tee -a "$RUNNER_TEMP/x360browser-validation.log"
+          (cd "$DIST" && sha256sum X360Browser-4.3.0-source.zip > X360Browser-4.3.0-source.zip.sha256)
 
-      - name: Upload validated source and test log
+      - name: Upload validated source archive and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: X360Browser-4.3.0-validated-source
+          # Keep these two files in one directory. Do not add the log path here:
+          # upload-artifact uses their common ancestor as the archive root.
+          path: |
+            ${{ runner.temp }}/x360browser-dist/X360Browser-4.3.0-source.zip
+            ${{ runner.temp }}/x360browser-dist/X360Browser-4.3.0-source.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload source validation log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: X360Browser-4.2.0-validated-source
-          path: |
-            ${{ runner.temp }}/x360browser-dist/X360Browser-4.2.0-source.zip
-            ${{ runner.temp }}/x360browser-dist/X360Browser-4.2.0-source.zip.sha256
-            ${{ runner.temp }}/x360browser-validation.log
+          name: X360Browser-4.3.0-validation-log
+          path: ${{ runner.temp }}/x360browser-validation.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -237,7 +247,7 @@ jobs:
       - name: Download exact source that passed validation
         uses: actions/download-artifact@v4
         with:
-          name: X360Browser-4.2.0-validated-source
+          name: X360Browser-4.3.0-validated-source
           path: ${{ runner.temp }}/validated
 
       - name: Install PowerPC/xSDK build dependencies
@@ -251,19 +261,71 @@ jobs:
             pkg-config libgmp-dev libmpfr-dev libmpc-dev libisl-dev zlib1g-dev \
             libexpat1-dev libssl-dev xz-utils rsync
 
-      - name: Extract validated source
+      - name: Extract validated source (artifact-path-safe)
         shell: bash
         run: |
           set -Eeuo pipefail
-          ARCHIVE="$RUNNER_TEMP/validated/X360Browser-4.2.0-source.zip"
-          test -s "$ARCHIVE"
-          unzip -t "$ARCHIVE"
+          BUILD_LOG="$RUNNER_TEMP/x360browser-xex-build.log"
+          : > "$BUILD_LOG"
+          log() { printf '%s\n' "$*" | tee -a "$BUILD_LOG"; }
+          DOWNLOAD_DIR="$RUNNER_TEMP/validated"
+
+          # actions/download-artifact normally extracts files at the artifact root.
+          # Search recursively anyway: older upload steps included a sibling log,
+          # which changed the common ancestor and nested the ZIP under x360browser-dist/.
+          mapfile -t ARCHIVES < <(find "$DOWNLOAD_DIR" -type f \
+            -name 'X360Browser-4.3.0-source.zip' -print 2>/dev/null | sort)
+          if (( ${#ARCHIVES[@]} != 1 )); then
+            log "ERROR: expected exactly one validated source ZIP; found ${#ARCHIVES[@]}"
+            log "Downloaded artifact contents:"
+            find "$DOWNLOAD_DIR" -maxdepth 6 -type f -print 2>/dev/null | sort | tee -a "$BUILD_LOG" || true
+            exit 2
+          fi
+          ARCHIVE="${ARCHIVES[0]}"
+          CHECKSUM="$(find "$(dirname "$ARCHIVE")" -maxdepth 1 -type f \
+            -name 'X360Browser-4.3.0-source.zip.sha256' -print -quit)"
+          if [[ -z "$CHECKSUM" || ! -s "$CHECKSUM" ]]; then
+            log "ERROR: source ZIP checksum file is missing beside the archive: $ARCHIVE"
+            exit 2
+          fi
+          log "Located validated source ZIP: $ARCHIVE"
+          (cd "$(dirname "$ARCHIVE")" && sha256sum -c "$(basename "$CHECKSUM")") \
+            2>&1 | tee -a "$BUILD_LOG"
+          unzip -t "$ARCHIVE" 2>&1 | tee -a "$BUILD_LOG"
+
           PROJECT_DIR="$RUNNER_TEMP/x360browser-xex-source"
           rm -rf "$PROJECT_DIR"
           mkdir -p "$PROJECT_DIR"
-          unzip -q "$ARCHIVE" -d "$PROJECT_DIR"
-          test "$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")" = "4.2.0"
-          : > "$RUNNER_TEMP/x360browser-xex-build.log"
+          # Validate archive paths before extracting; avoid ../ and symlink entries.
+          python3 - "$ARCHIVE" "$PROJECT_DIR" <<'PY'
+          from pathlib import Path, PurePosixPath
+          import sys, zipfile
+          archive = Path(sys.argv[1])
+          target = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              entries = zf.infolist()
+              if len(entries) > 6000:
+                  raise SystemExit("ZIP rejected: too many entries")
+              if sum(e.file_size for e in entries) > 120 * 1024 * 1024:
+                  raise SystemExit("ZIP rejected: uncompressed content exceeds 120 MiB")
+              for entry in entries:
+                  path = PurePosixPath(entry.filename)
+                  mode = (entry.external_attr >> 16) & 0o170000
+                  if "\\" in entry.filename or path.is_absolute() or ".." in path.parts or mode == 0o120000:
+                      raise SystemExit(f"ZIP rejected: unsafe path {entry.filename!r}")
+              zf.extractall(target)
+          PY
+          if [[ ! -s "$PROJECT_DIR/VERSION" ]]; then
+            log "ERROR: VERSION missing after extraction; archive root may be incorrect."
+            find "$PROJECT_DIR" -maxdepth 3 -type f -print | sort | tee -a "$BUILD_LOG" || true
+            exit 2
+          fi
+          FOUND_VERSION="$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")"
+          if [[ "$FOUND_VERSION" != "4.3.0" ]]; then
+            log "ERROR: expected source version 4.3.0, found $FOUND_VERSION"
+            exit 2
+          fi
+          log "Validated and extracted source version $FOUND_VERSION"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Cache PowerPC toolchain and dependency checkouts
@@ -306,17 +368,17 @@ jobs:
             [[ -s "$license" ]] && cp "$license" "$STAGE/"
           done
           (cd "$STAGE" && sha256sum X360Browser.xex cacert.pem X360Browser-video-config.txt X360Browser-bookmarks.txt > SHA256SUMS.txt)
-          (cd "$STAGE" && zip -9 -X -q "$DIST/X360Browser-4.2.0-Xbox360.zip" ./*)
-          (cd "$DIST" && sha256sum X360Browser-4.2.0-Xbox360.zip > X360Browser-4.2.0-Xbox360.zip.sha256)
-          cat "$DIST/X360Browser-4.2.0-Xbox360.zip.sha256"
+          (cd "$STAGE" && zip -9 -X -q "$DIST/X360Browser-4.3.0-Xbox360.zip" ./*)
+          (cd "$DIST" && sha256sum X360Browser-4.3.0-Xbox360.zip > X360Browser-4.3.0-Xbox360.zip.sha256)
+          cat "$DIST/X360Browser-4.3.0-Xbox360.zip.sha256"
 
       - name: Upload Xbox 360 XEX package
         uses: actions/upload-artifact@v4
         with:
-          name: X360Browser-4.2.0-Xbox360-XEX
+          name: X360Browser-4.3.0-Xbox360-XEX
           path: |
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-4.2.0-Xbox360.zip
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-4.2.0-Xbox360.zip.sha256
+            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-4.3.0-Xbox360.zip
+            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-4.3.0-Xbox360.zip.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -324,7 +386,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: X360Browser-4.2.0-XEX-build-log
+          name: X360Browser-4.3.0-XEX-build-log
           path: ${{ runner.temp }}/x360browser-xex-build.log
           if-no-files-found: warn
           retention-days: 30
