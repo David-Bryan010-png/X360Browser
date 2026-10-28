@@ -10,7 +10,6 @@ on:
         type: string
   push:
     branches: [main, master, principal]
-    tags: ["v*"]
     paths:
       - "CMakeLists.txt"
       - "VERSION"
@@ -48,7 +47,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -181,10 +180,14 @@ jobs:
 
           for required in \
             VERSION CMakeLists.txt README.md CHANGELOG.md \
-            tests/run_host_tests.py tests/validate_project_integrity.py tests/test_xbox_shader_contract.py tests/test_workflow_artifact_paths.py \
+            tests/run_host_tests.py tests/validate_project_integrity.py tests/test_xbox_shader_contract.py tests/test_workflow_artifact_paths.py tests/test_default_xex_contract.py \
             tests/web_engine_fixture_server.py tests/test_web_engine_native.c \
             tests/test_web_engine_dispatch.c tests/test_youtube_compatibility.c tests/test_auto_update_contract.py \
-            tests/test_update_manifest.c \
+            tests/test_update_manifest.c tests/test_runtime_view_contract.py \
+            docs/COMPATIBILITY-5.3.0.md docs/SOURCE-CHANGES-5.3.0.md docs/GRAPHICAL-ENGINE-5.3.0-pt-BR.md \
+            docs/COMPATIBILITY-6.0.0.md docs/SOURCE-CHANGES-6.0.0.md docs/GRAPHICAL-ENGINE-6.0.0-pt-BR.md \
+            docs/COMPATIBILITY-6.1.0.md docs/SOURCE-CHANGES-6.1.0.md docs/AUTO-UPDATE-GITHUB-6.1.0-pt-BR.md docs/COMPATIBILITY-6.2.0.md docs/SOURCE-CHANGES-6.2.0.md docs/ENGINE-AUDIT-6.2.0.md docs/AUTO-UPDATE-GITHUB-6.2.0-pt-BR.md \
+            tests/test_auto_release_contract.py tests/test_default_xex_contract.py \
             tests/test_xenonweb.c tests/test_xenonweb_layout.c tests/test_xenonscript.c tests/test_xenonmedia.c \
             docs/COMPATIBILITY-5.2.0.md docs/SOURCE-CHANGES-5.2.0.md docs/GRAPHICAL-ENGINE-5.2.0-pt-BR.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
             platform/xbox360/xsdk/visual_renderer.c platform/xbox360/xsdk/visual_renderer.h \
@@ -219,7 +222,9 @@ jobs:
           python3 tests/test_xbox_shader_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
           python3 tests/test_workflow_artifact_paths.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
           python3 tests/test_auto_update_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 -m py_compile tests/run_host_tests.py tests/validate_project_integrity.py tests/web_engine_fixture_server.py tests/test_workflow_artifact_paths.py tests/test_auto_update_contract.py
+          python3 tests/test_auto_release_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
+          python3 tests/test_default_xex_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
+          python3 -m py_compile tests/run_host_tests.py tests/validate_project_integrity.py tests/web_engine_fixture_server.py tests/test_workflow_artifact_paths.py tests/test_auto_update_contract.py tests/test_auto_release_contract.py tests/test_default_xex_contract.py tests/test_runtime_view_contract.py
           bash -n tools/build_xbox_shell.sh
 
       - name: Run XenonWeb, XenonScript, XenonMedia, transport and URL regressions
@@ -267,7 +272,7 @@ jobs:
           (cd "$DIST" && sha256sum "X360Browser-${PROJECT_VERSION}-source.zip" > "X360Browser-${PROJECT_VERSION}-source.zip.sha256")
 
       - name: Upload validated source archive and checksum
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: X360Browser-${{ steps.source.outputs.version }}-validated-source
           # Keep these two files in one directory. Do not add the log path here:
@@ -280,7 +285,7 @@ jobs:
 
       - name: Upload source validation log
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: X360Browser-${{ steps.source.outputs.version }}-validation-log
           path: ${{ runner.temp }}/x360browser-validation.log
@@ -294,7 +299,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Download exact source that passed validation
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8.0.2
         with:
           name: X360Browser-${{ needs.validate.outputs.version }}-validated-source
           path: ${{ runner.temp }}/validated
@@ -381,7 +386,7 @@ jobs:
           echo "PROJECT_VERSION=$FOUND_VERSION" >> "$GITHUB_ENV"
 
       - name: Cache PowerPC toolchain and dependency checkouts
-        uses: actions/cache@v5
+        uses: actions/cache@v6.0.0
         with:
           path: |
             ~/xsdk-gcc
@@ -401,6 +406,7 @@ jobs:
           cd "$PROJECT_DIR"
           bash tools/build_xbox_shell.sh 2>&1 | tee -a "$RUNNER_TEMP/x360browser-xex-build.log"
           test -s build-xbox360/X360Browser.xex
+          test -s build-xbox360/default.xex
           test -s build-xbox360/cacert.pem
           test -s build-xbox360/X360Browser-video-config.txt
           test -f build-xbox360/X360Browser-bookmarks.txt
@@ -412,22 +418,22 @@ jobs:
           DIST="$RUNNER_TEMP/x360browser-xex-dist"
           STAGE="$RUNNER_TEMP/x360browser-xex-stage"
           mkdir -p "$DIST" "$STAGE"
-          for file in X360Browser.xex cacert.pem README.txt X360Browser-video-config.txt X360Browser-bookmarks.txt; do
+          for file in default.xex cacert.pem README.txt X360Browser-video-config.txt X360Browser-bookmarks.txt; do
             test -f "$PROJECT_DIR/build-xbox360/$file"
             cp "$PROJECT_DIR/build-xbox360/$file" "$STAGE/$file"
           done
           for license in "$PROJECT_DIR"/build-xbox360/LICENSE-*.txt; do
             [[ -s "$license" ]] && cp "$license" "$STAGE/"
           done
-          (cd "$STAGE" && sha256sum X360Browser.xex cacert.pem X360Browser-video-config.txt X360Browser-bookmarks.txt > SHA256SUMS.txt)
-          cp "$STAGE/X360Browser.xex" "$DIST/X360Browser.xex"
-          (cd "$DIST" && sha256sum X360Browser.xex > X360Browser.xex.sha256)
+          (cd "$STAGE" && sha256sum default.xex cacert.pem X360Browser-video-config.txt X360Browser-bookmarks.txt > SHA256SUMS.txt)
+          cp "$STAGE/default.xex" "$DIST/default.xex"
+          (cd "$DIST" && sha256sum default.xex > default.xex.sha256)
           (cd "$STAGE" && zip -9 -X -q "$DIST/X360Browser-${PROJECT_VERSION}-Xbox360.zip" ./*)
           (cd "$DIST" && sha256sum "X360Browser-${PROJECT_VERSION}-Xbox360.zip" > "X360Browser-${PROJECT_VERSION}-Xbox360.zip.sha256")
           cat "$DIST/X360Browser-${PROJECT_VERSION}-Xbox360.zip.sha256"
 
       - name: Upload Xbox 360 XEX package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: X360Browser-${{ needs.validate.outputs.version }}-Xbox360-XEX
           path: |
@@ -436,22 +442,51 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish stable GitHub Release for automatic updates
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Guard against reusing a published version
+        id: release_guard
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/principal'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ needs.validate.outputs.version }}
+          BUILT_XEX: ${{ runner.temp }}/x360browser-xex-dist/default.xex
+        run: |
+          set -Eeuo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            OLD_DIR="$RUNNER_TEMP/previous-release"
+            mkdir -p "$OLD_DIR"
+            if ! gh release download "$RELEASE_TAG" --pattern default.xex --dir "$OLD_DIR"; then
+              echo "::error::Release $RELEASE_TAG already exists but its XEX could not be compared. Bump VERSION to publish a new release."
+              exit 1
+            fi
+            if ! cmp -s "$OLD_DIR/default.xex" "$BUILT_XEX"; then
+              echo "::error::VERSION ${{ needs.validate.outputs.version }} has already been published with different bytes. Increase VERSION (for example, patch +1) before publishing an updated XEX."
+              exit 1
+            fi
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Identical XEX already published as $RELEASE_TAG; no duplicate release needed."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release after successful XEX build
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/principal') && steps.release_guard.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v3.0.3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: X360Browser ${{ github.ref_name }}
+          tag_name: v${{ needs.validate.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: X360Browser v${{ needs.validate.outputs.version }}
+          make_latest: true
           generate_release_notes: true
           files: |
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser.xex
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser.xex.sha256
+            ${{ runner.temp }}/x360browser-xex-dist/default.xex
+            ${{ runner.temp }}/x360browser-xex-dist/default.xex.sha256
             ${{ runner.temp }}/x360browser-xex-dist/X360Browser-${{ needs.validate.outputs.version }}-Xbox360.zip
             ${{ runner.temp }}/x360browser-xex-dist/X360Browser-${{ needs.validate.outputs.version }}-Xbox360.zip.sha256
 
       - name: Upload XEX build log even after failure
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: X360Browser-${{ needs.validate.outputs.version }}-XEX-build-log
           path: ${{ runner.temp }}/x360browser-xex-build.log
