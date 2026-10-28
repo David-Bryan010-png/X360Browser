@@ -26,8 +26,8 @@ on:
       - "docs/**"
       - "examples/**"
       - "X360Browser-video-config.example.txt"
-      - "X360Browser-update-config.example.txt"
-      - "vercel/**"
+      - "platform/xbox360/xsdk/update_manifest.c"
+      - "platform/xbox360/xsdk/update_manifest.h"
       - "*.zip"
       - "**/*.zip"
       - ".github/workflows/build-xex-from-zip.yml"
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.source.outputs.version }}
-    timeout-minutes: 50
+    timeout-minutes: 35
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -184,17 +184,17 @@ jobs:
             tests/run_host_tests.py tests/validate_project_integrity.py tests/test_xbox_shader_contract.py tests/test_workflow_artifact_paths.py \
             tests/web_engine_fixture_server.py tests/test_web_engine_native.c \
             tests/test_web_engine_dispatch.c tests/test_youtube_compatibility.c tests/test_auto_update_contract.py \
-            tests/test_vercel_update_api.mjs \
+            tests/test_update_manifest.c \
             tests/test_xenonweb.c tests/test_xenonweb_layout.c tests/test_xenonscript.c tests/test_xenonmedia.c \
-            docs/COMPATIBILITY-5.1.0.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
+            docs/COMPATIBILITY-5.2.0.md docs/SOURCE-CHANGES-5.2.0.md docs/GRAPHICAL-ENGINE-5.2.0-pt-BR.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
             platform/xbox360/xsdk/visual_renderer.c platform/xbox360/xsdk/visual_renderer.h \
             platform/xbox360/xsdk/visual_layout.h platform/xbox360/xsdk/main.c \
             platform/xbox360/xsdk/update_manager.c platform/xbox360/xsdk/update_manager.h \
             platform/xbox360/xsdk/web_engine.c platform/xbox360/xsdk/CMakeLists.txt \
             engine/xenonweb/xw_dom.c engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c engine/xenonweb/xw_layout.c \
             engine/xenonmedia/xm_media.c engine/xenonmedia/xm_playback.c \
-            X360Browser-video-config.example.txt X360Browser-update-config.example.txt \
-            vercel/api/update.js vercel/vercel.json vercel/package.json \
+            X360Browser-video-config.example.txt \
+            platform/xbox360/xsdk/update_manifest.c platform/xbox360/xsdk/update_manifest.h \
             tools/build_xbox_shell.sh; do
             [[ -s "$PROJECT_DIR/$required" ]] || { log "::error::Missing required source: $required"; exit 2; }
           done
@@ -219,8 +219,6 @@ jobs:
           python3 tests/test_xbox_shader_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
           python3 tests/test_workflow_artifact_paths.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
           python3 tests/test_auto_update_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          node tests/test_vercel_update_api.mjs 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          node --check vercel/api/update.js
           python3 -m py_compile tests/run_host_tests.py tests/validate_project_integrity.py tests/web_engine_fixture_server.py tests/test_workflow_artifact_paths.py tests/test_auto_update_contract.py
           bash -n tools/build_xbox_shell.sh
 
@@ -414,14 +412,14 @@ jobs:
           DIST="$RUNNER_TEMP/x360browser-xex-dist"
           STAGE="$RUNNER_TEMP/x360browser-xex-stage"
           mkdir -p "$DIST" "$STAGE"
-          for file in X360Browser.xex cacert.pem README.txt X360Browser-video-config.txt X360Browser-update-config.txt X360Browser-bookmarks.txt; do
+          for file in X360Browser.xex cacert.pem README.txt X360Browser-video-config.txt X360Browser-bookmarks.txt; do
             test -f "$PROJECT_DIR/build-xbox360/$file"
             cp "$PROJECT_DIR/build-xbox360/$file" "$STAGE/$file"
           done
           for license in "$PROJECT_DIR"/build-xbox360/LICENSE-*.txt; do
             [[ -s "$license" ]] && cp "$license" "$STAGE/"
           done
-          (cd "$STAGE" && sha256sum X360Browser.xex cacert.pem X360Browser-video-config.txt X360Browser-bookmarks.txt X360Browser-update-config.txt > SHA256SUMS.txt)
+          (cd "$STAGE" && sha256sum X360Browser.xex cacert.pem X360Browser-video-config.txt X360Browser-bookmarks.txt > SHA256SUMS.txt)
           cp "$STAGE/X360Browser.xex" "$DIST/X360Browser.xex"
           (cd "$DIST" && sha256sum X360Browser.xex > X360Browser.xex.sha256)
           (cd "$STAGE" && zip -9 -X -q "$DIST/X360Browser-${PROJECT_VERSION}-Xbox360.zip" ./*)
