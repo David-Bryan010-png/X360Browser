@@ -1,10 +1,10 @@
-name: X360Browser — validate and build Xbox 360 XEX automatically
+name: X360Browser 6.5.0 — validate, build default.xex, and publish GitHub Release automatically
 
 on:
   workflow_dispatch:
     inputs:
       source_archive:
-        description: "Optional source ZIP path in the repository; blank auto-detects the checked-out source tree or ZIP"
+        description: "Optional source ZIP path in the repository (example: X360Browser-6.5.0-source.zip); blank auto-detects the highest semantic source version"
         required: false
         default: ""
         type: string
@@ -30,6 +30,7 @@ on:
       - "*.zip"
       - "**/*.zip"
       - ".github/workflows/build-xex-from-zip.yml"
+      - ".github/workflows/build-xex-from-zip-6.5.0.yml"
 
 permissions:
   contents: write
@@ -124,6 +125,8 @@ jobs:
             case "$REAL" in "$GITHUB_WORKSPACE"/*) ARCHIVE="$REAL" ;; *) log "::error::ZIP path resolves outside the repository."; exit 2 ;; esac
           else
             # Resolve both a checked-out source tree and packaged source archives.
+          # For 6.5.0, commit X360Browser-6.5.0-source.zip; the highest semantic
+          # source ZIP wins when it is newer than the checked-out source tree.
             # If a committed release ZIP is newer than the checked-out tree, prefer
             # that ZIP; this keeps phone-only ZIP uploads from accidentally building
             # an older source tree still present in the repository.
@@ -469,6 +472,7 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Publishes default.xex only after the validated source has built successfully.
       - name: Publish GitHub Release after successful XEX build
         if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/principal') && steps.release_guard.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3.0.3
