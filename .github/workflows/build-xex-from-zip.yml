@@ -1,10 +1,10 @@
-name: X360Browser 6.5.0 — validate, build default.xex, and publish GitHub Release automatically
+name: X360Browser — validate and build Xbox 360 XEX automatically
 
 on:
   workflow_dispatch:
     inputs:
       source_archive:
-        description: "Optional source ZIP path in the repository (example: X360Browser-6.5.0-source.zip); blank auto-detects the highest semantic source version"
+        description: "Optional source ZIP path in the repository; blank auto-detects the checked-out source tree or ZIP"
         required: false
         default: ""
         type: string
@@ -30,7 +30,6 @@ on:
       - "*.zip"
       - "**/*.zip"
       - ".github/workflows/build-xex-from-zip.yml"
-      - ".github/workflows/build-xex-from-zip-6.5.0.yml"
 
 permissions:
   contents: write
@@ -125,8 +124,6 @@ jobs:
             case "$REAL" in "$GITHUB_WORKSPACE"/*) ARCHIVE="$REAL" ;; *) log "::error::ZIP path resolves outside the repository."; exit 2 ;; esac
           else
             # Resolve both a checked-out source tree and packaged source archives.
-          # For 6.5.0, commit X360Browser-6.5.0-source.zip; the highest semantic
-          # source ZIP wins when it is newer than the checked-out source tree.
             # If a committed release ZIP is newer than the checked-out tree, prefer
             # that ZIP; this keeps phone-only ZIP uploads from accidentally building
             # an older source tree still present in the repository.
@@ -190,6 +187,7 @@ jobs:
             docs/COMPATIBILITY-5.3.0.md docs/SOURCE-CHANGES-5.3.0.md docs/GRAPHICAL-ENGINE-5.3.0-pt-BR.md \
             docs/COMPATIBILITY-6.0.0.md docs/SOURCE-CHANGES-6.0.0.md docs/GRAPHICAL-ENGINE-6.0.0-pt-BR.md \
             docs/COMPATIBILITY-6.1.0.md docs/SOURCE-CHANGES-6.1.0.md docs/AUTO-UPDATE-GITHUB-6.1.0-pt-BR.md docs/COMPATIBILITY-6.2.0.md docs/SOURCE-CHANGES-6.2.0.md docs/ENGINE-AUDIT-6.2.0.md docs/AUTO-UPDATE-GITHUB-6.2.0-pt-BR.md \
+            docs/COMPATIBILITY-7.0.0.md docs/SOURCE-CHANGES-7.0.0.md docs/ENGINE-AUDIT-7.0.0.md \
             tests/test_auto_release_contract.py tests/test_default_xex_contract.py \
             tests/test_xenonweb.c tests/test_xenonweb_layout.c tests/test_xenonscript.c tests/test_xenonmedia.c \
             docs/COMPATIBILITY-5.2.0.md docs/SOURCE-CHANGES-5.2.0.md docs/GRAPHICAL-ENGINE-5.2.0-pt-BR.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
@@ -215,41 +213,6 @@ jobs:
           echo "version=$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
           log "Source root: $PROJECT_DIR"
           log "Source version: $PROJECT_VERSION"
-
-      - name: Synchronize generated version header from VERSION
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          python3 - <<'PYVERSION'
-          from pathlib import Path
-          import re
-
-          version = Path("VERSION").read_text(encoding="utf-8").strip()
-          match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
-          if not match:
-              raise SystemExit(f"ERROR: VERSION must be MAJOR.MINOR.PATCH, found {version!r}")
-          header_path = Path("include/x360browser/version.hpp")
-          if not header_path.is_file():
-              raise SystemExit("ERROR: include/x360browser/version.hpp is missing")
-          header = header_path.read_text(encoding="utf-8")
-          generated = {
-              "X360BROWSER_VERSION_MAJOR": match.group(1),
-              "X360BROWSER_VERSION_MINOR": match.group(2),
-              "X360BROWSER_VERSION_PATCH": match.group(3),
-              "X360BROWSER_VERSION_STRING": f'"{version}"',
-          }
-          for name, value in generated.items():
-              pattern = rf"(?m)^\s*#\s*define\s+{name}\s+.*$"
-              updated, count = re.subn(pattern, f"#define {name} {value}", header)
-              if count != 1:
-                  raise SystemExit(
-                      f"ERROR: expected exactly one definition of {name} in {header_path}; found {count}"
-                  )
-              header = updated
-          header_path.write_text(header, encoding="utf-8")
-          print(f"Synchronized embedded version header to {version}")
-          PYVERSION
 
       - name: Validate package and regression markers
         shell: bash
@@ -424,7 +387,7 @@ jobs:
           echo "PROJECT_VERSION=$FOUND_VERSION" >> "$GITHUB_ENV"
 
       - name: Cache PowerPC toolchain and dependency checkouts
-        uses: actions/cache@v6.0.0
+        uses: actions/cache@v6.1.0
         with:
           path: |
             ~/xsdk-gcc
@@ -507,7 +470,6 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # Publishes default.xex only after the validated source has built successfully.
       - name: Publish GitHub Release after successful XEX build
         if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/principal') && steps.release_guard.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3.0.3
