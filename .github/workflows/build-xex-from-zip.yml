@@ -216,6 +216,41 @@ jobs:
           log "Source root: $PROJECT_DIR"
           log "Source version: $PROJECT_VERSION"
 
+      - name: Synchronize generated version header from VERSION
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          python3 - <<'PYVERSION'
+          from pathlib import Path
+          import re
+
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+          if not match:
+              raise SystemExit(f"ERROR: VERSION must be MAJOR.MINOR.PATCH, found {version!r}")
+          header_path = Path("include/x360browser/version.hpp")
+          if not header_path.is_file():
+              raise SystemExit("ERROR: include/x360browser/version.hpp is missing")
+          header = header_path.read_text(encoding="utf-8")
+          generated = {
+              "X360BROWSER_VERSION_MAJOR": match.group(1),
+              "X360BROWSER_VERSION_MINOR": match.group(2),
+              "X360BROWSER_VERSION_PATCH": match.group(3),
+              "X360BROWSER_VERSION_STRING": f'"{version}"',
+          }
+          for name, value in generated.items():
+              pattern = rf"(?m)^\s*#\s*define\s+{name}\s+.*$"
+              updated, count = re.subn(pattern, f"#define {name} {value}", header)
+              if count != 1:
+                  raise SystemExit(
+                      f"ERROR: expected exactly one definition of {name} in {header_path}; found {count}"
+                  )
+              header = updated
+          header_path.write_text(header, encoding="utf-8")
+          print(f"Synchronized embedded version header to {version}")
+          PYVERSION
+
       - name: Validate package and regression markers
         shell: bash
         run: |
