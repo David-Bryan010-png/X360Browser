@@ -1,22 +1,27 @@
+
 name: X360 Web Total 0.2.0 - Validated Source, Host Tests and XeLL USB Build
 
 on:
   workflow_dispatch:
     inputs:
       source_archive:
-        description: ZIP or source folder inside source/ (leave default to use the standard v0.2.0 path)
+        description: Optional repository-relative ZIP or folder path. Leave empty for automatic detection in root/ or source/.
         required: false
-        default: source/X360-Web-Total-0.2.0-source.zip
+        default: ''
         type: string
   push:
     branches: [main]
     paths:
       - 'source/**'
+      - 'X360-Web-Total-0.2.0-source.zip'
+      - 'X360-Web-Total-0.2.0/**'
       - '.github/workflows/build-xex-from-zip.yml'
   pull_request:
     branches: [main]
     paths:
       - 'source/**'
+      - 'X360-Web-Total-0.2.0-source.zip'
+      - 'X360-Web-Total-0.2.0/**'
       - '.github/workflows/build-xex-from-zip.yml'
 
 permissions:
@@ -40,8 +45,10 @@ jobs:
     name: Locate and validate ONLY X360 Web Total v0.2.0
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+
     outputs:
       source_version: ${{ steps.validate.outputs.version }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
@@ -52,7 +59,7 @@ jobs:
       - name: Safely select, extract and verify source
         id: validate
         env:
-          SOURCE_ARCHIVE_INPUT: ${{ inputs.source_archive || 'source/X360-Web-Total-0.2.0-source.zip' }}
+          SOURCE_ARCHIVE_INPUT: ${{ inputs.source_archive || '' }}
         run: |
           set -Eeuo pipefail
           python3 - <<'PY'
@@ -65,179 +72,387 @@ jobs:
           from pathlib import Path, PurePosixPath
 
           workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          requested = os.environ['SOURCE_ARCHIVE_INPUT'].replace('\\', '/')
-          requested_path = PurePosixPath(requested)
-          if (requested_path.is_absolute() or '..' in requested_path.parts
-                  or not requested_path.parts or requested_path.parts[0] != 'source'):
-              raise SystemExit('SOURCE ERROR: source_archive must be a safe path inside source/.')
-
-          preferred = workspace.joinpath(*requested_path.parts)
-          default_dir = workspace / 'source' / 'X360-Web-Total-0.2.0'
+          requested = os.environ.get('SOURCE_ARCHIVE_INPUT', '').strip().replace('\\', '/')
           archive_path = None
           directory_source = None
 
-          if preferred.is_file() and preferred.suffix.lower() == '.zip':
-              archive_path = preferred
-          elif preferred.is_dir() and (preferred / 'VERSION').is_file():
-              directory_source = preferred
-          elif default_dir.is_dir() and (default_dir / 'VERSION').is_file():
-              directory_source = default_dir
-          else:
-              source_dir = workspace / 'source'
-              candidates = sorted(source_dir.glob('X360-Web-Total-0.2.0*.zip')) if source_dir.is_dir() else []
-              if len(candidates) == 1:
-                  archive_path = candidates[0]
-              elif len(candidates) > 1:
-                  raise SystemExit('SOURCE ERROR: multiple v0.2.0 ZIPs found; set source_archive to one exact path.')
+          def inside_workspace(candidate):
+              try:
+                  candidate.resolve().relative_to(workspace)
+                  return True
+              except ValueError:
+                  return False
+
+          if requested:
+              requested_path = PurePosixPath(requested)
+              if (requested_path.is_absolute() or '..' in requested_path.parts
+                      or not requested_path.parts or ':' in requested_path.parts[0]):
+                  raise SystemExit('SOURCE ERROR: source_archive must be a safe repository-relative path.')
+
+              selected = workspace.joinpath(*requested_path.parts)
+
+              if not inside_workspace(selected):
+                  raise SystemExit('SOURCE ERROR: selected source path escapes the repository.')
+
+              if selected.is_file() and selected.suffix.lower() == '.zip':
+                  archive_path = selected
+              elif selected.is_dir():
+                  directory_source = selected
               else:
-                  raise SystemExit(
-                      'SOURCE ERROR: v0.2.0 source not found. Add '
-                      'source/X360-Web-Total-0.2.0-source.zip OR extract the project into '
-                      'source/X360-Web-Total-0.2.0/. Old ZIPs in the repository root are ignored.'
-                  )
+                  raise SystemExit(f'SOURCE ERROR: requested source path does not exist: {requested}')
+
+          else:
+              # The current repository stores the v0.2.0 archive in its ROOT.
+              # Also accept the organized source/ location and extracted folders.
+              exact_archives = [
+                  workspace / 'X360-Web-Total-0.2.0-source.zip',
+                  workspace / 'source' / 'X360-Web-Total-0.2.0-source.zip',
+              ]
+
+              exact_directories = [
+                  workspace / 'X360-Web-Total-0.2.0',
+                  workspace / 'source' / 'X360-Web-Total-0.2.0',
+              ]
+
+              archive_candidates = [item for item in exact_archives if item.is_file()]
+              directory_candidates = [item for item in exact_directories if item.is_dir()]
+
+              if archive_candidates:
+                  # Prefer the exact canonical filename. Root is first because
+                  # that is where the confirmed repository currently stores it.
+                  archive_path = archive_candidates[0]
+
+                  if len(archive_candidates) > 1:
+                      print('NOTICE: multiple canonical v0.2.0 ZIPs exist; using the root copy first.')
+
+              elif directory_candidates:
+                  directory_source = directory_candidates[0]
+
+                  if len(directory_candidates) > 1:
+                      print('NOTICE: multiple canonical v0.2.0 folders exist; using the root copy first.')
+
+              else:
+                  # Permit harmless suffixes, but never select an older 0.1.x archive.
+                  patterns = [
+                      workspace.glob('X360-Web-Total-0.2.0*.zip'),
+                      (workspace / 'source').glob('X360-Web-Total-0.2.0*.zip'),
+                  ]
+
+                  discovered = []
+
+                  for pattern in patterns:
+                      discovered.extend(item for item in pattern if item.is_file())
+
+                  discovered = sorted(set(discovered), key=lambda item: (
+                      0 if item.parent == workspace else 1,
+                      item.name.lower()
+                  ))
+
+                  if len(discovered) == 1:
+                      archive_path = discovered[0]
+
+                  elif len(discovered) > 1:
+                      raise SystemExit(
+                          'SOURCE ERROR: multiple v0.2.0 ZIPs found. Set workflow_dispatch input '
+                          'source_archive to the exact repository-relative path.'
+                      )
+
+                  else:
+                      root_items = sorted(item.name for item in workspace.iterdir())
+                      source_dir = workspace / 'source'
+
+                      source_items = (
+                          sorted(item.name for item in source_dir.iterdir())
+                          if source_dir.is_dir() else []
+                      )
+
+                      raise SystemExit(
+                          'SOURCE ERROR: no X360 Web Total 0.2.0 source was found. '
+                          'Expected X360-Web-Total-0.2.0-source.zip in repository root or source/, '
+                          'or folder X360-Web-Total-0.2.0/ in either location. '
+                          f'Root contains: {root_items}; source/ contains: {source_items}. '
+                          'The 0.1.0 archive is deliberately ignored.'
+                      )
+
+          if archive_path is not None and not inside_workspace(archive_path):
+              raise SystemExit('SOURCE ERROR: archive path escapes the repository.')
+
+          if directory_source is not None and not inside_workspace(directory_source):
+              raise SystemExit('SOURCE ERROR: source folder escapes the repository.')
 
           destination = Path(os.environ['RUNNER_TEMP']) / 'x360-web-total-source'
+
           if destination.exists():
               shutil.rmtree(destination)
+
           destination.mkdir(parents=True)
 
           def safe_relative(raw_name):
               if not raw_name or '\\' in raw_name or '\x00' in raw_name or raw_name.startswith('/'):
                   raise ValueError(f'unsafe source path: {raw_name!r}')
+
               parts = raw_name.rstrip('/').split('/')
+
               if not parts or any(part in ('', '.', '..') for part in parts) or ':' in parts[0]:
                   raise ValueError(f'unsafe source path: {raw_name!r}')
+
               if len(raw_name) > 240 or any(part.endswith(('.', ' ')) for part in parts):
                   raise ValueError(f'non-portable source path: {raw_name!r}')
+
               return PurePosixPath(*parts)
 
           if directory_source is not None:
-              if directory_source.resolve().parent != (workspace / 'source').resolve():
-                  raise SystemExit('SOURCE ERROR: source folder must be directly inside source/.')
-              if (directory_source / 'VERSION').read_text(encoding='ascii').strip() != '0.2.0':
+              allowed_parents = {
+                  workspace.resolve(),
+                  (workspace / 'source').resolve()
+              }
+
+              if directory_source.resolve().parent not in allowed_parents:
+                  raise SystemExit(
+                      'SOURCE ERROR: source folder must be directly in repository root or source/.'
+                  )
+
+              version_file = directory_source / 'VERSION'
+
+              if not version_file.is_file() or version_file.read_text(encoding='ascii').strip() != '0.2.0':
                   raise SystemExit('SOURCE ERROR: selected folder is not version 0.2.0.')
+
               for item in directory_source.rglob('*'):
                   if item.is_symlink():
                       raise SystemExit(f'SOURCE ERROR: symbolic links are not allowed: {item}')
+
                   if item.is_file():
                       relative = item.relative_to(directory_source).as_posix()
                       safe_relative(relative)
+
                       if item.stat().st_size > 16 * 1024 * 1024:
                           raise SystemExit(f'SOURCE ERROR: file exceeds 16 MiB: {relative}')
+
               shutil.copytree(
-                  directory_source, destination, dirs_exist_ok=True,
-                  ignore=shutil.ignore_patterns('.git', 'build', 'build-host', '__pycache__')
+                  directory_source,
+                  destination,
+                  dirs_exist_ok=True,
+                  ignore=shutil.ignore_patterns(
+                      '.git', 'build', 'build-host', '__pycache__'
+                  )
               )
+
               selected = f'directory:{directory_source.relative_to(workspace)}'
+
           else:
               if archive_path.stat().st_size > 64 * 1024 * 1024:
                   raise SystemExit('SOURCE ERROR: compressed ZIP exceeds 64 MiB.')
+
               with zipfile.ZipFile(archive_path) as archive:
                   entries = archive.infolist()
                   files = [entry for entry in entries if not entry.is_dir()]
+
                   if not files or len(entries) > 2000:
                       raise SystemExit('SOURCE ERROR: ZIP is empty or contains too many entries.')
+
                   if sum(entry.file_size for entry in files) > 64 * 1024 * 1024:
                       raise SystemExit('SOURCE ERROR: expanded ZIP exceeds 64 MiB.')
+
                   names = set()
                   folded = set()
                   version_roots = set()
                   normalized = {}
+
                   for entry in entries:
                       rel = safe_relative(entry.filename)
                       name = rel.as_posix()
                       key = name.casefold()
+
                       if name in names or key in folded:
-                          raise SystemExit(f'SOURCE ERROR: duplicate/case-colliding ZIP path: {name}')
+                          raise SystemExit(
+                              f'SOURCE ERROR: duplicate/case-colliding ZIP path: {name}'
+                          )
+
                       names.add(name)
                       folded.add(key)
+
                       mode = (entry.external_attr >> 16) & 0xffff
+
                       if stat.S_ISLNK(mode):
                           raise SystemExit(f'SOURCE ERROR: symbolic link in ZIP: {name}')
+
                       if not entry.is_dir():
                           if entry.file_size > 16 * 1024 * 1024:
                               raise SystemExit(f'SOURCE ERROR: file exceeds 16 MiB: {name}')
+
                           normalized[name] = rel
+
                           if rel.name == 'VERSION':
                               version_roots.add(rel.parent)
+
                   if len(version_roots) != 1:
-                      raise SystemExit(f'SOURCE ERROR: expected one VERSION file; found {len(version_roots)}.')
+                      raise SystemExit(
+                          f'SOURCE ERROR: expected one VERSION file; found {len(version_roots)}.'
+                      )
+
                   root = next(iter(version_roots))
                   root_prefix = root.as_posix() + '/' if root.parts else ''
+
                   for entry in files:
                       name = entry.filename
+
                       if not name.startswith(root_prefix):
                           raise SystemExit(f'SOURCE ERROR: file outside project root: {name}')
+
                   bad = archive.testzip()
+
                   if bad is not None:
                       raise SystemExit(f'SOURCE ERROR: ZIP CRC check failed at {bad}')
+
                   for entry in files:
-                      rel = normalized[entry.filename].relative_to(root) if root.parts else normalized[entry.filename]
+                      rel = (
+                          normalized[entry.filename].relative_to(root)
+                          if root.parts else normalized[entry.filename]
+                      )
+
                       if not rel.parts:
-                          raise SystemExit('SOURCE ERROR: empty file path after source-root removal.')
+                          raise SystemExit(
+                              'SOURCE ERROR: empty file path after source-root removal.'
+                          )
+
                       target = destination.joinpath(*rel.parts)
                       target.parent.mkdir(parents=True, exist_ok=True)
+
                       with archive.open(entry) as src, target.open('wb') as dst:
                           shutil.copyfileobj(src, dst)
+
               selected = f'zip:{archive_path.relative_to(workspace)}'
 
           version_file = destination / 'VERSION'
+
           if not version_file.is_file() or version_file.read_text(encoding='ascii').strip() != '0.2.0':
               raise SystemExit('SOURCE ERROR: source VERSION must be exactly 0.2.0.')
 
           required = [
-              'browser/CMakeLists.txt', 'browser/Makefile', 'browser/src/main.c',
-              'browser/src/xw_dns_wire.c', 'browser/src/xw_dns_lwip.c',
-              'browser/src/xw_http_lwip.c', 'browser/src/xw_http_protocol.c',
-              'browser/src/xw_config.c', 'browser/include/xw_config.h',
-              'browser/tests/test_core.c', 'scripts/package_usb.py',
-              'scripts/test_package_usb.py', 'docs/BOOT-FLOW.md',
-              'README-INSTALL-PT-BR.txt', 'usb/X360WebTotal/config/browser.ini',
+              'browser/CMakeLists.txt',
+              'browser/Makefile',
+              'browser/src/main.c',
+              'browser/src/xw_dns_wire.c',
+              'browser/src/xw_dns_lwip.c',
+              'browser/src/xw_http_lwip.c',
+              'browser/src/xw_http_protocol.c',
+              'browser/src/xw_config.c',
+              'browser/include/xw_config.h',
+              'browser/tests/test_core.c',
+              'scripts/package_usb.py',
+              'scripts/test_package_usb.py',
+              'docs/BOOT-FLOW.md',
+              'README-INSTALL-PT-BR.txt',
+              'usb/X360WebTotal/config/browser.ini',
               'SOURCE-MANIFEST.sha256',
           ]
-          missing = [name for name in required if not (destination / name).is_file()]
+
+          missing = [
+              name for name in required
+              if not (destination / name).is_file()
+          ]
+
           if missing:
-              raise SystemExit('SOURCE ERROR: incomplete v0.2.0 package: ' + ', '.join(missing))
+              raise SystemExit(
+                  'SOURCE ERROR: incomplete v0.2.0 package: ' + ', '.join(missing)
+              )
 
           manifest = destination / 'SOURCE-MANIFEST.sha256'
           checked = 0
-          for line_number, line in enumerate(manifest.read_text(encoding='ascii').splitlines(), 1):
+
+          for line_number, line in enumerate(
+              manifest.read_text(encoding='ascii').splitlines(), 1
+          ):
               if not line.strip():
                   continue
+
               try:
                   expected, relative = line.split('  ', 1)
                   rel = safe_relative(relative)
               except ValueError as exc:
-                  raise SystemExit(f'SOURCE ERROR: invalid manifest line {line_number}: {exc}')
+                  raise SystemExit(
+                      f'SOURCE ERROR: invalid manifest line {line_number}: {exc}'
+                  )
+
               target = destination.joinpath(*rel.parts)
+
               if not target.is_file():
                   raise SystemExit(f'SOURCE ERROR: manifest file missing: {relative}')
+
               actual = hashlib.sha256(target.read_bytes()).hexdigest()
+
               if actual.lower() != expected.lower():
                   raise SystemExit(f'SOURCE ERROR: SHA-256 mismatch: {relative}')
+
               checked += 1
+
           if checked == 0:
               raise SystemExit('SOURCE ERROR: source manifest is empty.')
 
-          makefile = (destination / 'browser/Makefile').read_text(encoding='utf-8', errors='replace')
-          cmake = (destination / 'browser/CMakeLists.txt').read_text(encoding='utf-8', errors='replace')
-          packager = (destination / 'scripts/package_usb.py').read_text(encoding='utf-8', errors='replace')
-          contracts = {
-              'Xenon cross compiler': 'xenon-' in makefile and '$(CROSS)gcc' in makefile,
-              'LibXenon libraries': '-lxenon' in makefile and '-lfat' in makefile,
-              'host C tests': 'add_test' in cmake and 'xw_core_tests' in cmake,
-              'ELF validation': 'validate_elf' in packager,
+          manifested = set()
+
+          for line in manifest.read_text(encoding='ascii').splitlines():
+              if line.strip():
+                  _digest, relative = line.split('  ', 1)
+                  manifested.add(PurePosixPath(relative).as_posix())
+
+          actual_source_files = {
+              item.relative_to(destination).as_posix()
+              for item in destination.rglob('*')
+              if item.is_file() and item != manifest
           }
-          failed = [label for label, passed in contracts.items() if not passed]
+
+          if manifested != actual_source_files:
+              unlisted = sorted(actual_source_files - manifested)
+              absent = sorted(manifested - actual_source_files)
+
+              raise SystemExit(
+                  'SOURCE ERROR: manifest coverage differs from source tree. '
+                  f'Unlisted files: {unlisted}; missing files: {absent}'
+              )
+
+          makefile = (
+              destination / 'browser/Makefile'
+          ).read_text(encoding='utf-8', errors='replace')
+
+          cmake = (
+              destination / 'browser/CMakeLists.txt'
+          ).read_text(encoding='utf-8', errors='replace')
+
+          packager = (
+              destination / 'scripts/package_usb.py'
+          ).read_text(encoding='utf-8', errors='replace')
+
+          contracts = {
+              'Xenon cross compiler':
+                  'xenon-' in makefile and '$(CROSS)gcc' in makefile,
+              'LibXenon libraries':
+                  '-lxenon' in makefile and '-lfat' in makefile,
+              'host C tests':
+                  'add_test' in cmake and 'xw_core_tests' in cmake,
+              'ELF validation':
+                  'validate_elf' in packager,
+          }
+
+          failed = [
+              label for label, passed in contracts.items()
+              if not passed
+          ]
+
           for label, passed in contracts.items():
               print(f'{"PASS" if passed else "FAIL"}: {label}')
+
           if failed:
-              raise SystemExit('SOURCE ERROR: source contract failed: ' + ', '.join(failed))
+              raise SystemExit(
+                  'SOURCE ERROR: source contract failed: ' + ', '.join(failed)
+              )
 
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
               env.write(f'XW_SOURCE_ROOT={destination}\n')
+
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               output.write('version=0.2.0\n')
+
           print(f'SELECTED SOURCE: {selected}')
           print(f'VERIFIED MANIFEST ENTRIES: {checked}')
           print('SOURCE VALIDATION PASSED: exact version 0.2.0.')
@@ -257,6 +472,7 @@ jobs:
     needs: prepare-source
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+
     strategy:
       fail-fast: false
       matrix:
@@ -265,14 +481,17 @@ jobs:
             label: Linux GCC + ASan/UBSan
             compiler: gcc
             sanitizers: 'ON'
+
           - os: ubuntu-24.04
             label: Linux Clang
             compiler: clang
             sanitizers: 'OFF'
+
           - os: windows-2022
             label: Windows MSVC + Ninja
             compiler: msvc
             sanitizers: 'OFF'
+
     steps:
       - name: Download normalized v0.2.0 source
         uses: actions/download-artifact@v8.0.2
@@ -298,22 +517,29 @@ jobs:
           XW_SANITIZERS: ${{ matrix.sanitizers }}
         run: |
           set -Eeuo pipefail
+
           build="$RUNNER_TEMP/xw-host-build"
           flags=''
           linker_flags=''
+
           if [[ "$XW_SANITIZERS" == 'ON' ]]; then
             flags='-fsanitize=address,undefined -fno-omit-frame-pointer'
             linker_flags='-fsanitize=address,undefined'
           fi
+
           {
             cmake -S "$XW_SOURCE/browser" -B "$build" \
               -DCMAKE_BUILD_TYPE=Debug \
               -DCMAKE_C_COMPILER="$XW_COMPILER" \
               -DCMAKE_C_FLAGS="$flags" \
               -DCMAKE_EXE_LINKER_FLAGS="$linker_flags"
+
             cmake --build "$build" --parallel 2
+
             ctest --test-dir "$build" --output-on-failure --no-tests=error
+
             python3 "$XW_SOURCE/scripts/test_package_usb.py"
+
           } 2>&1 | tee "$RUNNER_TEMP/host-tests.log"
 
       - name: Configure, compile and run C tests (MSVC/Ninja)
@@ -324,13 +550,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $build = Join-Path $env:RUNNER_TEMP 'xw-host-build'
+
           cmake -S (Join-Path $env:XW_SOURCE 'browser') -B $build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl
+
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           cmake --build $build --parallel 2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           ctest --test-dir $build --output-on-failure --no-tests=error
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python (Join-Path $env:XW_SOURCE 'scripts/test_package_usb.py')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -348,6 +579,7 @@ jobs:
     needs: prepare-source
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+
     steps:
       - name: Download normalized v0.2.0 source
         uses: actions/download-artifact@v8.0.2
@@ -363,7 +595,9 @@ jobs:
           XW_SOURCE: ${{ runner.temp }}/x360-web-total-source
         run: |
           set -Eeuo pipefail
+
           log="$RUNNER_TEMP/libxenon-build.log"
+
           docker run --rm \
             --volume "$XW_SOURCE/browser:/workspace/browser" \
             --workdir /workspace/browser \
@@ -371,23 +605,30 @@ jobs:
             "$LIBXENON_IMAGE" \
             -lc 'set -Eeuo pipefail; export DEVKITXENON=/usr/local/xenon; export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"; make clean all DEVKITXENON="$DEVKITXENON"' \
             2>&1 | tee "$log"
+
           test -s "$XW_SOURCE/browser/xenon.elf"
+
           python3 - "$XW_SOURCE/browser/xenon.elf" "$XW_SOURCE/scripts" <<'PY'
           from pathlib import Path
           import sys
+
           sys.path.insert(0, sys.argv[2])
           import package_usb
+
           elf = Path(sys.argv[1])
           package_usb.validate_elf(elf)
+
           print(f'ELF VALID: {elf.stat().st_size} bytes, ELF32 PowerPC big-endian.')
           PY
 
       - name: Download and verify XellLaunch2 2.2.0
         run: |
           set -Eeuo pipefail
+
           curl --fail --show-error --location --retry 4 --retry-all-errors \
             --connect-timeout 20 --max-time 180 \
             "$XELL_LAUNCH2_URL" --output "$RUNNER_TEMP/XellLaunch2.xex"
+
           echo "$XELL_LAUNCH2_SHA256  $RUNNER_TEMP/XellLaunch2.xex" | sha256sum --check
 
       - name: Create and verify FAT32 USB package
@@ -395,6 +636,7 @@ jobs:
           XW_SOURCE: ${{ runner.temp }}/x360-web-total-source
         run: |
           set -Eeuo pipefail
+
           python3 "$XW_SOURCE/scripts/package_usb.py" \
             --elf "$XW_SOURCE/browser/xenon.elf" \
             --xell "$RUNNER_TEMP/XellLaunch2.xex" \
@@ -428,7 +670,7 @@ jobs:
           {
             echo '## X360 Web Total 0.2.0'
             echo
-            echo '- Source: exact VERSION 0.2.0 and SHA-256 manifest validated.'
+            echo '- Source: auto-detected in repository root or source/; exact VERSION 0.2.0 and complete SHA-256 manifest validated.'
             echo '- Host checks run independently from the PowerPC build.'
             echo '- Target output: `xenon.elf` (LibXenon ELF32, big-endian PowerPC).'
             echo '- Launcher: XellLaunch2 2.2.0, pinned SHA-256 verified.'
@@ -442,6 +684,7 @@ jobs:
     if: ${{ always() }}
     needs: [prepare-source, host-tests, xenon-build]
     runs-on: ubuntu-24.04
+
     steps:
       - name: Report job results
         env:
@@ -456,8 +699,10 @@ jobs:
             echo "- Host tests: $HOST_RESULT"
             echo "- LibXenon build and USB packaging: $XENON_RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
+
           if [[ "$SOURCE_RESULT" != success || "$HOST_RESULT" != success || "$XENON_RESULT" != success ]]; then
             echo 'At least one required validation job failed. Open its diagnostic artifact.'
             exit 1
           fi
+
           echo 'All source, host, PowerPC and package validations passed.'
