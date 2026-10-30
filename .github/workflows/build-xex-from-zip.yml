@@ -5,71 +5,303 @@ on:
   push:
     paths:
       - 'browser/**'
-      - 'usb/**'
+      - '**/browser/**'
       - 'scripts/**'
-      - '.github/workflows/build-x360-web-total.yml'
+      - '**/scripts/**'
+      - 'usb/**'
+      - '**/usb/**'
+      - '*.zip'
+      - '**/*.zip'
       - 'VERSION'
+      - '**/VERSION'
+      - '.github/workflows/build-x360-web-total.yml'
+      - '**/.github/workflows/build-x360-web-total.yml'
 
 permissions:
   contents: read
 
-jobs:
-  host-tests:
-    name: Host parser and protocol tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Configure and build
-        run: cmake -S browser -B build-host -DCMAKE_BUILD_TYPE=Release
-      - name: Compile
-        run: cmake --build build-host --parallel 2
-      - name: Run tests
-        run: ctest --test-dir build-host --output-on-failure
+env:
+  XELL_LAUNCH2_VERSION: '2.2.0'
+  XELL_LAUNCH2_SHA256: '49dd8666b83a7c7b37597affc46513fe2cb9ab5cb2fe1fb71da1b13175276bb0'
 
-  build-xenon:
-    name: Build LibXenon ELF and USB package
+jobs:
+  build:
+    name: Locate source, test, build ELF and package USB
     runs-on: ubuntu-latest
-    needs: host-tests
+    timeout-minutes: 45
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Build in the official LibXenon image
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Find project root automatically (folder or ZIP)
+        id: source
+        shell: bash
         run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import shutil
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          required = (
+              "browser/CMakeLists.txt",
+              "browser/Makefile",
+              "browser/src/main.c",
+              "scripts/package_usb.py",
+              "usb/X360WebTotal/config/browser.ini",
+              "docs/BOOT-FLOW.md",
+              "README-INSTALL-PT-BR.txt",
+          )
+
+          def missing_from_dir(root: Path):
+              return [item for item in required if not (root / item).is_file()]
+
+          def find_project_directly():
+              if not missing_from_dir(workspace):
+                  return workspace
+              ignored = {".git", "node_modules", "build", "build-host", ".venv", "venv"}
+              for current, dirs, files in os.walk(workspace):
+                  rel_depth = len(Path(current).relative_to(workspace).parts)
+                  dirs[:] = [d for d in dirs if d not in ignored]
+                  if rel_depth >= 7:
+                      dirs[:] = []
+                  if Path(current).name == "browser" and "CMakeLists.txt" in files:
+                      root = Path(current).parent
+                      if not missing_from_dir(root):
+                          return root
+              return None
+
+          def normalize_zip_name(name: str) -> str:
+              name = name.replace("\\", "/")
+              while name.startswith("./"):
+                  name = name[2:]
+              return name
+
+          def find_source_archive():
+              archives = [p for p in workspace.rglob("*.zip") if p.is_file()]
+              archives.sort(key=lambda p: (
+                  0 if "x360-web-total-rebuild" in p.name.lower() else
+                  1 if "rebuild" in p.name.lower() else 2,
+                  len(p.parts),
+                  p.name.lower(),
+              ))
+              for archive_path in archives:
+                  try:
+                      with zipfile.ZipFile(archive_path) as archive:
+                          names = {normalize_zip_name(n) for n in archive.namelist() if n and not n.endswith("/")}
+                          cmake_entries = sorted(
+                              n for n in names
+                              if PurePosixPath(n).name == "CMakeLists.txt"
+                              and PurePosixPath(n).parent.name == "browser"
+                          )
+                          for cmake_entry in cmake_entries:
+                              prefix = PurePosixPath(cmake_entry).parent.parent
+                              expected = [str(prefix / item) if str(prefix) != "." else item for item in required]
+                              if all(item in names for item in expected):
+                                  return archive_path, str(prefix)
+                  except (zipfile.BadZipFile, OSError) as exc:
+                      print(f"Ignoring unreadable ZIP {archive_path}: {exc}")
+              return None
+
+          project_root = find_project_directly()
+          if project_root is None:
+              archive_match = find_source_archive()
+              if archive_match is None:
+                  top = sorted(p.name for p in workspace.iterdir())
+                  print("ERROR: no complete X360 Web Total source tree was found.")
+                  print("Expected browser/CMakeLists.txt plus scripts/package_usb.py and the USB/docs files.")
+                  print("The workflow also accepts the complete X360-Web-Total-Rebuild source ZIP in the repository.")
+                  print("Repository top-level entries:", top)
+                  sys.exit(2)
+
+              archive_path, prefix = archive_match
+              extract_root = Path(os.environ["RUNNER_TEMP"]) / "x360-web-total-source"
+              if extract_root.exists():
+                  shutil.rmtree(extract_root)
+              extract_root.mkdir(parents=True)
+              with zipfile.ZipFile(archive_path) as archive:
+                  for member in archive.infolist():
+                      raw = normalize_zip_name(member.filename)
+                      path = PurePosixPath(raw)
+                      if path.is_absolute() or ".." in path.parts or (path.parts and path.parts[0].endswith(":")):
+                          raise SystemExit(f"Unsafe path in source ZIP: {member.filename}")
+                  archive.extractall(extract_root)
+              project_root = extract_root / prefix if prefix != "." else extract_root
+              print(f"Extracted source archive: {archive_path}")
+
+          missing = missing_from_dir(project_root)
+          if missing:
+              print("ERROR: source tree is incomplete. Missing files:")
+              for item in missing:
+                  print(f" - {item}")
+              sys.exit(3)
+
+          browser_dir = project_root / "browser"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"XW_PROJECT_ROOT={project_root}\n")
+              env.write(f"XW_BROWSER_DIR={browser_dir}\n")
+          print(f"Project root: {project_root}")
+          print(f"Browser source: {browser_dir}")
+          print("Required source files: OK")
+          PY
+
+      - name: Configure host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$XW_BROWSER_DIR/CMakeLists.txt"
+          cmake -S "$XW_BROWSER_DIR" -B "$RUNNER_TEMP/xw-host-build" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile host tests
+        shell: bash
+        run: cmake --build "$RUNNER_TEMP/xw-host-build" --parallel 2
+
+      - name: Run host tests
+        shell: bash
+        run: ctest --test-dir "$RUNNER_TEMP/xw-host-build" --output-on-failure
+
+      - name: Check Docker and LibXenon toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker --version
           docker pull free60/libxenon:latest
+          docker run --rm --entrypoint /bin/sh free60/libxenon:latest -ec '
+            set -eu
+            if [ -n "${DEVKITXENON:-}" ] && [ -x "$DEVKITXENON/bin/xenon-gcc" ]; then
+              prefix="$DEVKITXENON"
+            else
+              compiler="$(command -v xenon-gcc || true)"
+              if [ -n "$compiler" ]; then
+                prefix="$(dirname "$(dirname "$compiler")")"
+              else
+                prefix=""
+                for candidate in /usr/local/xenon /opt/xenon /root/x360/devkitxenon /xenon; do
+                  if [ -x "$candidate/bin/xenon-gcc" ]; then prefix="$candidate"; break; fi
+                done
+              fi
+            fi
+            if [ -z "$prefix" ] || [ ! -x "$prefix/bin/xenon-gcc" ]; then
+              echo "ERROR: xenon-gcc was not found in free60/libxenon:latest." >&2
+              echo "Checked DEVKITXENON, PATH, /usr/local/xenon, /opt/xenon and /root/x360/devkitxenon." >&2
+              exit 10
+            fi
+            export DEVKITXENON="$prefix"
+            export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"
+            for tool in xenon-gcc xenon-objcopy xenon-strip; do
+              command -v "$tool" >/dev/null || { echo "ERROR: missing $tool in $DEVKITXENON/bin" >&2; exit 11; }
+            done
+            test -f "$DEVKITXENON/app.lds" || { echo "ERROR: missing $DEVKITXENON/app.lds" >&2; exit 12; }
+            echo "LibXenon toolchain OK: $DEVKITXENON"
+          '
+
+      - name: Build LibXenon ELF
+        shell: bash
+        run: |
+          set -euo pipefail
           docker run --rm \
-            --volume "$GITHUB_WORKSPACE/browser:/app" \
+            --volume "$XW_BROWSER_DIR:/app" \
             --workdir /app \
             --entrypoint /bin/sh \
             free60/libxenon:latest \
-            -lc 'export DEVKITXENON=/usr/local/xenon; export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"; make clean all'
-      - name: Verify ELF output
+            -ec '
+              set -eu
+              if [ -n "${DEVKITXENON:-}" ] && [ -x "$DEVKITXENON/bin/xenon-gcc" ]; then
+                prefix="$DEVKITXENON"
+              else
+                compiler="$(command -v xenon-gcc || true)"
+                if [ -n "$compiler" ]; then
+                  prefix="$(dirname "$(dirname "$compiler")")"
+                else
+                  prefix=""
+                  for candidate in /usr/local/xenon /opt/xenon /root/x360/devkitxenon /xenon; do
+                    if [ -x "$candidate/bin/xenon-gcc" ]; then prefix="$candidate"; break; fi
+                  done
+                fi
+              fi
+              if [ -z "$prefix" ] || [ ! -x "$prefix/bin/xenon-gcc" ]; then
+                echo "ERROR: cannot locate xenon-gcc in the LibXenon image." >&2
+                exit 10
+              fi
+              export DEVKITXENON="$prefix"
+              export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"
+              make clean
+              make --jobs=2 all DEVKITXENON="$DEVKITXENON"
+              test -s xenon.elf
+            '
+
+      - name: Validate ELF format and architecture
+        shell: bash
         run: |
-          test -s browser/xenon.elf
+          set -euo pipefail
+          python3 - "$XW_BROWSER_DIR/xenon.elf" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = path.read_bytes()
+          if len(data) < 52:
+              raise SystemExit(f"ELF is too small: {len(data)} bytes")
+          if data[:4] != b"\x7fELF":
+              raise SystemExit("Invalid ELF magic")
+          if data[4] != 1:
+              raise SystemExit("Expected ELF32 (class=1)")
+          if data[5] != 2:
+              raise SystemExit("Expected big-endian ELF (data=2)")
+          if data[6] != 1:
+              raise SystemExit("Unsupported ELF identification version")
+          elf_type, machine = struct.unpack(">HH", data[16:20])
+          if machine != 20:
+              raise SystemExit(f"Expected PowerPC EM_PPC=20, got {machine}")
+          if elf_type != 2:
+              raise SystemExit(f"Expected executable ELF ET_EXEC=2, got {elf_type}")
+          entry = struct.unpack(">I", data[24:28])[0]
+          phoff = struct.unpack(">I", data[28:32])[0]
+          phentsize, phnum = struct.unpack(">HH", data[42:46])
+          if entry == 0 or phoff == 0 or phentsize == 0 or phnum == 0:
+              raise SystemExit("ELF has no valid entry point or program header table")
+          print(f"ELF OK: {len(data)} bytes; ELF32 big-endian PowerPC; entry=0x{entry:08X}; segments={phnum}")
+          PY
+
+      - name: Download and verify XellLaunch2
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 \
+            "https://github.com/mitchellwaite/XellLaunch2/releases/download/v${XELL_LAUNCH2_VERSION}/XellLaunch2.xex" \
+            --output "$RUNNER_TEMP/XellLaunch2.xex"
+          echo "$XELL_LAUNCH2_SHA256  $RUNNER_TEMP/XellLaunch2.xex" | sha256sum --check
+          test -s "$RUNNER_TEMP/XellLaunch2.xex"
+
+      - name: Assemble and verify FAT32 USB package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$XW_PROJECT_ROOT/scripts/package_usb.py" \
+            --elf "$XW_BROWSER_DIR/xenon.elf" \
+            --xell "$RUNNER_TEMP/XellLaunch2.xex" \
+            --project "$XW_PROJECT_ROOT" \
+            --output "$GITHUB_WORKSPACE/X360-Web-Total-USB.zip"
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('browser/xenon.elf')
-          b = p.read_bytes()
-          assert b[:4] == b'\x7fELF', 'ELF magic is missing'
-          assert b[4] == 1, 'Expected ELF32'
-          assert b[5] == 2, 'Expected big-endian PowerPC ELF'
-          assert int.from_bytes(b[18:20], 'big') == 20, 'Expected EM_PPC'
-          print(f'ELF validated: {len(b)} bytes, ELF32 big-endian PowerPC')
+          import zipfile
+          package = Path("X360-Web-Total-USB.zip")
+          with zipfile.ZipFile(package) as z:
+              names = set(z.namelist())
+          required = {"xenon.elf", "XellLaunch2.xex", "LEIA-ME.txt", "FLUXO-DE-INICIALIZACAO.txt", "SHA256SUMS.txt", "X360WebTotal/config/browser.ini"}
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit("USB package is incomplete: " + ", ".join(missing))
+          print(f"USB package OK: {package.stat().st_size} bytes; {len(names)} files")
           PY
-      - name: Download and verify XellLaunch2 2.2.0
-        run: |
-          curl --fail --location --retry 3 \
-            'https://github.com/mitchellwaite/XellLaunch2/releases/download/v2.2.0/XellLaunch2.xex' \
-            --output XellLaunch2.xex
-          echo '49dd8666b83a7c7b37597affc46513fe2cb9ab5cb2fe1fb71da1b13175276bb0  XellLaunch2.xex' | sha256sum --check
-      - name: Assemble and verify USB root
-        run: |
-          python3 scripts/package_usb.py \
-            --elf browser/xenon.elf \
-            --xell XellLaunch2.xex \
-            --project "$GITHUB_WORKSPACE" \
-            --output X360-Web-Total-USB.zip
-      - name: Upload flash-drive package
+
+      - name: Upload USB package
         uses: actions/upload-artifact@v4
         with:
           name: X360-Web-Total-USB
