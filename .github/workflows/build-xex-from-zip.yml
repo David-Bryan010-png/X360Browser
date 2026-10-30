@@ -1,29 +1,47 @@
-
-name: X360 Web Total — Full Audit, Multi-platform Tests and XeLL Package
+name: X360 Web Total 0.2.0 - Validated Source, Host Tests and XeLL USB Build
 
 on:
   workflow_dispatch:
+    inputs:
+      source_archive:
+        description: ZIP or source folder inside source/ (leave default to use the standard v0.2.0 path)
+        required: false
+        default: source/X360-Web-Total-0.2.0-source.zip
+        type: string
   push:
     branches: [main]
+    paths:
+      - 'source/**'
+      - '.github/workflows/build-xex-from-zip.yml'
   pull_request:
+    branches: [main]
+    paths:
+      - 'source/**'
+      - '.github/workflows/build-xex-from-zip.yml'
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
-  group: x360-web-total-${{ github.ref }}
+  group: x360-web-total-020-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   LIBXENON_IMAGE: free60/libxenon@sha256:3534d7952210ee5553790a1c1f12001145655e28f9e12a01ce151efe4b4f743d
-  XELL_LAUNCH2_VERSION: '2.2.0'
-  XELL_LAUNCH2_SHA256: '49dd8666b83a7c7b37597affc46513fe2cb9ab5cb2fe1fb71da1b13175276bb0'
+  XELL_LAUNCH2_URL: https://github.com/mitchellwaite/XellLaunch2/releases/download/v2.2.0/XellLaunch2.xex
+  XELL_LAUNCH2_SHA256: 49dd8666b83a7c7b37597affc46513fe2cb9ab5cb2fe1fb71da1b13175276bb0
 
 jobs:
-  discover-source:
-    name: Find and validate source folder or ZIP
-    runs-on: ubuntu-latest
+  prepare-source:
+    name: Locate and validate ONLY X360 Web Total v0.2.0
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      source_version: ${{ steps.validate.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
@@ -31,13 +49,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Discover source, safely extract ZIP and audit required files
-        id: source
-        shell: bash
+      - name: Safely select, extract and verify source
+        id: validate
+        env:
+          SOURCE_ARCHIVE_INPUT: ${{ inputs.source_archive || 'source/X360-Web-Total-0.2.0-source.zip' }}
         run: |
           set -Eeuo pipefail
-          exec > >(tee -a "$RUNNER_TEMP/source-discovery.log") 2>&1
           python3 - <<'PY'
+          import hashlib
           import os
           import shutil
           import stat
@@ -46,872 +65,399 @@ jobs:
           from pathlib import Path, PurePosixPath
 
           workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          destination = Path(os.environ['RUNNER_TEMP']) / 'x360-project'
-          required = [
-              'browser/CMakeLists.txt',
-              'browser/Makefile',
-              'browser/src/main.c',
-              'browser/src/xw_url.c',
-              'browser/src/xw_html.c',
-              'browser/src/xw_layout.c',
-              'browser/src/xw_http_protocol.c',
-              'browser/src/xw_http_lwip.c',
-              'browser/tests/test_core.c',
-              'scripts/package_usb.py',
-              'usb/X360WebTotal/config/browser.ini',
-              'docs/BOOT-FLOW.md',
-              'README-INSTALL-PT-BR.txt',
-          ]
-          ignored = {'.git', '.github', 'node_modules', 'build', 'build-host', '.venv', 'venv'}
-          errors = []
+          requested = os.environ['SOURCE_ARCHIVE_INPUT'].replace('\\', '/')
+          requested_path = PurePosixPath(requested)
+          if (requested_path.is_absolute() or '..' in requested_path.parts
+                  or not requested_path.parts or requested_path.parts[0] != 'source'):
+              raise SystemExit('SOURCE ERROR: source_archive must be a safe path inside source/.')
 
-          def complete(root):
-              return [item for item in required if not (root / item).is_file()]
+          preferred = workspace.joinpath(*requested_path.parts)
+          default_dir = workspace / 'source' / 'X360-Web-Total-0.2.0'
+          archive_path = None
+          directory_source = None
 
-          def safe_member(name):
-              name = name.replace('\\', '/')
-              while name.startswith('./'):
-                  name = name[2:]
-              p = PurePosixPath(name)
-              if p.is_absolute() or '..' in p.parts or (p.parts and p.parts[0].endswith(':')):
-                  raise ValueError(f'unsafe ZIP path: {name}')
-              return p
+          if preferred.is_file() and preferred.suffix.lower() == '.zip':
+              archive_path = preferred
+          elif preferred.is_dir() and (preferred / 'VERSION').is_file():
+              directory_source = preferred
+          elif default_dir.is_dir() and (default_dir / 'VERSION').is_file():
+              directory_source = default_dir
+          else:
+              source_dir = workspace / 'source'
+              candidates = sorted(source_dir.glob('X360-Web-Total-0.2.0*.zip')) if source_dir.is_dir() else []
+              if len(candidates) == 1:
+                  archive_path = candidates[0]
+              elif len(candidates) > 1:
+                  raise SystemExit('SOURCE ERROR: multiple v0.2.0 ZIPs found; set source_archive to one exact path.')
+              else:
+                  raise SystemExit(
+                      'SOURCE ERROR: v0.2.0 source not found. Add '
+                      'source/X360-Web-Total-0.2.0-source.zip OR extract the project into '
+                      'source/X360-Web-Total-0.2.0/. Old ZIPs in the repository root are ignored.'
+                  )
 
-          roots = []
-          if not complete(workspace):
-              roots.append(workspace)
-          if not roots:
-              for current, dirs, files in os.walk(workspace):
-                  here = Path(current)
-                  depth = len(here.relative_to(workspace).parts)
-                  dirs[:] = sorted(d for d in dirs if d not in ignored)
-                  if depth >= 8:
-                      dirs[:] = []
-                  if here.name == 'browser' and 'CMakeLists.txt' in files:
-                      candidate = here.parent
-                      if not complete(candidate):
-                          roots.append(candidate)
-              roots = sorted(set(roots), key=lambda p: (len(p.parts), p.as_posix()))
-
-          selected_root = roots[0] if roots else None
-          selected_zip = None
-          selected_prefix = PurePosixPath('.')
-
-          if selected_root is None:
-              archives = []
-              for current, dirs, files in os.walk(workspace):
-                  here = Path(current)
-                  depth = len(here.relative_to(workspace).parts)
-                  dirs[:] = [d for d in dirs if d not in ignored]
-                  if depth >= 7:
-                      dirs[:] = []
-                  archives.extend(here / f for f in files if f.lower().endswith('.zip'))
-              archives.sort(key=lambda p: (
-                  0 if 'x360-web-total-rebuild' in p.name.lower() else 1,
-                  0 if 'source' in p.name.lower() else 1,
-                  len(p.parts), p.name.lower()
-              ))
-              for archive_path in archives:
-                  try:
-                      with zipfile.ZipFile(archive_path) as archive:
-                          infos = [i for i in archive.infolist() if not i.is_dir()]
-                          if len(infos) > 5000:
-                              errors.append(f'{archive_path.name}: more than 5000 files')
-                              continue
-                          total = sum(i.file_size for i in infos)
-                          if total > 256 * 1024 * 1024:
-                              errors.append(f'{archive_path.name}: expanded size exceeds 256 MiB')
-                              continue
-                          names = set()
-                          prefixes = set()
-                          unsafe = False
-                          for info in infos:
-                              member = safe_member(info.filename)
-                              mode = (info.external_attr >> 16) & 0xFFFF
-                              if stat.S_ISLNK(mode):
-                                  raise ValueError(f'symlink not allowed: {info.filename}')
-                              if info.file_size > 64 * 1024 * 1024:
-                                  raise ValueError(f'file exceeds 64 MiB: {info.filename}')
-                              key = member.as_posix()
-                              if key in names:
-                                  raise ValueError(f'duplicate ZIP member: {key}')
-                              names.add(key)
-                              if member.name == 'CMakeLists.txt' and member.parent.name == 'browser':
-                                  prefixes.add(member.parent.parent)
-                          matched = None
-                          for prefix in sorted(prefixes, key=lambda p: (len(p.parts), p.as_posix())):
-                              paths = [((prefix / item).as_posix() if prefix.parts else item) for item in required]
-                              if all(path in names for path in paths):
-                                  matched = prefix
-                                  break
-                          if matched is not None:
-                              selected_zip = archive_path
-                              selected_prefix = matched
-                              break
-                  except (zipfile.BadZipFile, OSError, ValueError) as exc:
-                      errors.append(f'{archive_path.name}: {exc}')
-
-          if selected_root is None and selected_zip is None:
-              print('SOURCE AUDIT FAILED — no complete source tree was found.')
-              print('Required files:')
-              for item in required:
-                  print(f' - {item}')
-              if errors:
-                  print('Archive diagnostics:')
-                  for item in errors:
-                      print(f' - {item}')
-              print('Workspace entries:', sorted(p.name for p in workspace.iterdir()))
-              sys.exit(2)
-
+          destination = Path(os.environ['RUNNER_TEMP']) / 'x360-web-total-source'
           if destination.exists():
               shutil.rmtree(destination)
           destination.mkdir(parents=True)
-          if selected_root is not None:
-              for item in selected_root.iterdir():
-                  if item.name in {'.git', '.github'}:
-                      continue
-                  target = destination / item.name
-                  if item.is_dir():
-                      shutil.copytree(item, target)
-                  else:
-                      shutil.copy2(item, target)
-              print(f'Source selected from directory: {selected_root}')
-          else:
-              with zipfile.ZipFile(selected_zip) as archive:
-                  for info in archive.infolist():
-                      if info.is_dir():
-                          continue
-                      member = safe_member(info.filename)
-                      relative = member.relative_to(selected_prefix) if selected_prefix.parts else member
-                      if not relative.parts:
-                          continue
-                      target = destination.joinpath(*relative.parts)
-                      target.parent.mkdir(parents=True, exist_ok=True)
-                      with archive.open(info) as source, target.open('wb') as output:
-                          shutil.copyfileobj(source, output)
-              print(f'Source safely extracted from ZIP: {selected_zip}')
 
-          missing = complete(destination)
+          def safe_relative(raw_name):
+              if not raw_name or '\\' in raw_name or '\x00' in raw_name or raw_name.startswith('/'):
+                  raise ValueError(f'unsafe source path: {raw_name!r}')
+              parts = raw_name.rstrip('/').split('/')
+              if not parts or any(part in ('', '.', '..') for part in parts) or ':' in parts[0]:
+                  raise ValueError(f'unsafe source path: {raw_name!r}')
+              if len(raw_name) > 240 or any(part.endswith(('.', ' ')) for part in parts):
+                  raise ValueError(f'non-portable source path: {raw_name!r}')
+              return PurePosixPath(*parts)
+
+          if directory_source is not None:
+              if directory_source.resolve().parent != (workspace / 'source').resolve():
+                  raise SystemExit('SOURCE ERROR: source folder must be directly inside source/.')
+              if (directory_source / 'VERSION').read_text(encoding='ascii').strip() != '0.2.0':
+                  raise SystemExit('SOURCE ERROR: selected folder is not version 0.2.0.')
+              for item in directory_source.rglob('*'):
+                  if item.is_symlink():
+                      raise SystemExit(f'SOURCE ERROR: symbolic links are not allowed: {item}')
+                  if item.is_file():
+                      relative = item.relative_to(directory_source).as_posix()
+                      safe_relative(relative)
+                      if item.stat().st_size > 16 * 1024 * 1024:
+                          raise SystemExit(f'SOURCE ERROR: file exceeds 16 MiB: {relative}')
+              shutil.copytree(
+                  directory_source, destination, dirs_exist_ok=True,
+                  ignore=shutil.ignore_patterns('.git', 'build', 'build-host', '__pycache__')
+              )
+              selected = f'directory:{directory_source.relative_to(workspace)}'
+          else:
+              if archive_path.stat().st_size > 64 * 1024 * 1024:
+                  raise SystemExit('SOURCE ERROR: compressed ZIP exceeds 64 MiB.')
+              with zipfile.ZipFile(archive_path) as archive:
+                  entries = archive.infolist()
+                  files = [entry for entry in entries if not entry.is_dir()]
+                  if not files or len(entries) > 2000:
+                      raise SystemExit('SOURCE ERROR: ZIP is empty or contains too many entries.')
+                  if sum(entry.file_size for entry in files) > 64 * 1024 * 1024:
+                      raise SystemExit('SOURCE ERROR: expanded ZIP exceeds 64 MiB.')
+                  names = set()
+                  folded = set()
+                  version_roots = set()
+                  normalized = {}
+                  for entry in entries:
+                      rel = safe_relative(entry.filename)
+                      name = rel.as_posix()
+                      key = name.casefold()
+                      if name in names or key in folded:
+                          raise SystemExit(f'SOURCE ERROR: duplicate/case-colliding ZIP path: {name}')
+                      names.add(name)
+                      folded.add(key)
+                      mode = (entry.external_attr >> 16) & 0xffff
+                      if stat.S_ISLNK(mode):
+                          raise SystemExit(f'SOURCE ERROR: symbolic link in ZIP: {name}')
+                      if not entry.is_dir():
+                          if entry.file_size > 16 * 1024 * 1024:
+                              raise SystemExit(f'SOURCE ERROR: file exceeds 16 MiB: {name}')
+                          normalized[name] = rel
+                          if rel.name == 'VERSION':
+                              version_roots.add(rel.parent)
+                  if len(version_roots) != 1:
+                      raise SystemExit(f'SOURCE ERROR: expected one VERSION file; found {len(version_roots)}.')
+                  root = next(iter(version_roots))
+                  root_prefix = root.as_posix() + '/' if root.parts else ''
+                  for entry in files:
+                      name = entry.filename
+                      if not name.startswith(root_prefix):
+                          raise SystemExit(f'SOURCE ERROR: file outside project root: {name}')
+                  bad = archive.testzip()
+                  if bad is not None:
+                      raise SystemExit(f'SOURCE ERROR: ZIP CRC check failed at {bad}')
+                  for entry in files:
+                      rel = normalized[entry.filename].relative_to(root) if root.parts else normalized[entry.filename]
+                      if not rel.parts:
+                          raise SystemExit('SOURCE ERROR: empty file path after source-root removal.')
+                      target = destination.joinpath(*rel.parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with archive.open(entry) as src, target.open('wb') as dst:
+                          shutil.copyfileobj(src, dst)
+              selected = f'zip:{archive_path.relative_to(workspace)}'
+
+          version_file = destination / 'VERSION'
+          if not version_file.is_file() or version_file.read_text(encoding='ascii').strip() != '0.2.0':
+              raise SystemExit('SOURCE ERROR: source VERSION must be exactly 0.2.0.')
+
+          required = [
+              'browser/CMakeLists.txt', 'browser/Makefile', 'browser/src/main.c',
+              'browser/src/xw_dns_wire.c', 'browser/src/xw_dns_lwip.c',
+              'browser/src/xw_http_lwip.c', 'browser/src/xw_http_protocol.c',
+              'browser/src/xw_config.c', 'browser/include/xw_config.h',
+              'browser/tests/test_core.c', 'scripts/package_usb.py',
+              'scripts/test_package_usb.py', 'docs/BOOT-FLOW.md',
+              'README-INSTALL-PT-BR.txt', 'usb/X360WebTotal/config/browser.ini',
+              'SOURCE-MANIFEST.sha256',
+          ]
+          missing = [name for name in required if not (destination / name).is_file()]
           if missing:
-              print('SOURCE AUDIT FAILED — missing files after extraction:')
-              for item in missing:
-                  print(f' - {item}')
-              sys.exit(3)
+              raise SystemExit('SOURCE ERROR: incomplete v0.2.0 package: ' + ', '.join(missing))
+
+          manifest = destination / 'SOURCE-MANIFEST.sha256'
+          checked = 0
+          for line_number, line in enumerate(manifest.read_text(encoding='ascii').splitlines(), 1):
+              if not line.strip():
+                  continue
+              try:
+                  expected, relative = line.split('  ', 1)
+                  rel = safe_relative(relative)
+              except ValueError as exc:
+                  raise SystemExit(f'SOURCE ERROR: invalid manifest line {line_number}: {exc}')
+              target = destination.joinpath(*rel.parts)
+              if not target.is_file():
+                  raise SystemExit(f'SOURCE ERROR: manifest file missing: {relative}')
+              actual = hashlib.sha256(target.read_bytes()).hexdigest()
+              if actual.lower() != expected.lower():
+                  raise SystemExit(f'SOURCE ERROR: SHA-256 mismatch: {relative}')
+              checked += 1
+          if checked == 0:
+              raise SystemExit('SOURCE ERROR: source manifest is empty.')
 
           makefile = (destination / 'browser/Makefile').read_text(encoding='utf-8', errors='replace')
           cmake = (destination / 'browser/CMakeLists.txt').read_text(encoding='utf-8', errors='replace')
-          package = (destination / 'scripts/package_usb.py').read_text(encoding='utf-8', errors='replace')
-          checks = {
-              'Makefile defines the Xenon cross-compiler prefix': 'CROSS :=' in makefile and 'xenon-' in makefile and '$(CROSS)gcc' in makefile,
-              'Makefile links libfat': '-lfat' in makefile,
-              'Makefile links libxenon': '-lxenon' in makefile,
-              'CMake defines host tests': 'add_test' in cmake,
-              'USB packager validates ELF': 'validate_elf' in package,
+          packager = (destination / 'scripts/package_usb.py').read_text(encoding='utf-8', errors='replace')
+          contracts = {
+              'Xenon cross compiler': 'xenon-' in makefile and '$(CROSS)gcc' in makefile,
+              'LibXenon libraries': '-lxenon' in makefile and '-lfat' in makefile,
+              'host C tests': 'add_test' in cmake and 'xw_core_tests' in cmake,
+              'ELF validation': 'validate_elf' in packager,
           }
-          for label, passed in checks.items():
+          failed = [label for label, passed in contracts.items() if not passed]
+          for label, passed in contracts.items():
               print(f'{"PASS" if passed else "FAIL"}: {label}')
-          failed = [label for label, passed in checks.items() if not passed]
           if failed:
-              print('Source contract failures:', '; '.join(failed))
-              sys.exit(4)
+              raise SystemExit('SOURCE ERROR: source contract failed: ' + ', '.join(failed))
+
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-              env.write(f'XW_PROJECT_ROOT={destination}\n')
-          print('Source audit passed.')
+              env.write(f'XW_SOURCE_ROOT={destination}\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('version=0.2.0\n')
+          print(f'SELECTED SOURCE: {selected}')
+          print(f'VERIFIED MANIFEST ENTRIES: {checked}')
+          print('SOURCE VALIDATION PASSED: exact version 0.2.0.')
           PY
 
-      - name: Upload normalized source tree
+      - name: Upload normalized v0.2.0 source
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: x360-web-total-source
-          path: ${{ runner.temp }}/x360-project/**
+          name: x360-web-total-source-0.2.0
+          path: ${{ runner.temp }}/x360-web-total-source/**
+          include-hidden-files: true
           if-no-files-found: error
-          retention-days: 2
-
-      - name: Upload source discovery diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: x360-source-discovery-diagnostics
-          path: ${{ runner.temp }}/source-discovery.log
-          if-no-files-found: warn
-          retention-days: 14
+          retention-days: 3
 
   host-tests:
-    name: Host tests — ${{ matrix.label }}
-    needs: discover-source
+    name: Host tests - ${{ matrix.label }}
+    needs: prepare-source
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            label: Linux GCC
-            cc: gcc
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
+            label: Linux GCC + ASan/UBSan
+            compiler: gcc
+            sanitizers: 'ON'
+          - os: ubuntu-24.04
             label: Linux Clang
-            cc: clang
-          - os: macos-latest
-            label: macOS Clang
-            cc: clang
-          - os: windows-latest
-            label: Windows MSVC
-            cc: msvc
+            compiler: clang
+            sanitizers: 'OFF'
+          - os: windows-2022
+            label: Windows MSVC + Ninja
+            compiler: msvc
+            sanitizers: 'OFF'
     steps:
-      - name: Download normalized source
+      - name: Download normalized v0.2.0 source
         uses: actions/download-artifact@v8.0.2
         with:
-          name: x360-web-total-source
-          path: ${{ runner.temp }}/x360-project
+          name: x360-web-total-source-0.2.0
+          path: ${{ runner.temp }}/x360-web-total-source
 
-      - name: Install Clang on Linux
-        id: clang-install
-        if: runner.os == 'Linux' && matrix.cc == 'clang'
-        continue-on-error: true
-        shell: bash
+      - name: Install Clang
+        if: matrix.compiler == 'clang'
         run: |
-          set +e
-          log="$RUNNER_TEMP/clang-install.log"
-          sudo apt-get update >"$log" 2>&1
-          rc=$?
-          if (( rc == 0 )); then
-            sudo apt-get install -y --no-install-recommends clang cmake >>"$log" 2>&1
-            rc=$?
-          fi
-          cat "$log"
-          if (( rc != 0 )); then
-            echo "ERROR: Clang installation failed (exit $rc)."
-            exit "$rc"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang
 
-      - name: Configure, compile and test with GCC/Clang
-        id: host-build
-        if: runner.os != 'Windows'
-        continue-on-error: true
-        shell: bash
+      - name: Initialize MSVC environment
+        if: matrix.compiler == 'msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure, compile and run C tests (GCC/Clang)
+        if: matrix.compiler != 'msvc'
         env:
-          CC: ${{ matrix.cc }}
+          XW_SOURCE: ${{ runner.temp }}/x360-web-total-source
+          XW_COMPILER: ${{ matrix.compiler }}
+          XW_SANITIZERS: ${{ matrix.sanitizers }}
         run: |
-          set -uo pipefail
-          source_dir="$RUNNER_TEMP/x360-project/browser"
-          build_dir="$RUNNER_TEMP/host-build"
-          log="$RUNNER_TEMP/host-diagnostics.log"
-          : > "$log"
-          failed=0
-          run_check() {
-            label="$1"
-            shift
-            printf '\n===== %s =====\n' "$label" | tee -a "$log"
-            "$@" >>"$log" 2>&1
-            rc=$?
-            if (( rc == 0 )); then
-              echo "PASS: $label" | tee -a "$log"
-            else
-              echo "ERROR: $label failed (exit $rc)." | tee -a "$log"
-              failed=1
-            fi
-            return 0
-          }
-          run_check 'Compiler version' "$CC" --version
-          run_check 'CMake version' cmake --version
-          run_check 'CMake configure' env CC="$CC" cmake -S "$source_dir" -B "$build_dir" -G 'Unix Makefiles' \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$CC"
-          run_check 'Host compilation' cmake --build "$build_dir" --parallel 2
-          run_check 'CTest execution' ctest --test-dir "$build_dir" --output-on-failure --no-tests=error
-          cat "$log"
-          if (( failed != 0 )); then exit 1; fi
+          set -Eeuo pipefail
+          build="$RUNNER_TEMP/xw-host-build"
+          flags=''
+          linker_flags=''
+          if [[ "$XW_SANITIZERS" == 'ON' ]]; then
+            flags='-fsanitize=address,undefined -fno-omit-frame-pointer'
+            linker_flags='-fsanitize=address,undefined'
+          fi
+          {
+            cmake -S "$XW_SOURCE/browser" -B "$build" \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_C_COMPILER="$XW_COMPILER" \
+              -DCMAKE_C_FLAGS="$flags" \
+              -DCMAKE_EXE_LINKER_FLAGS="$linker_flags"
+            cmake --build "$build" --parallel 2
+            ctest --test-dir "$build" --output-on-failure --no-tests=error
+            python3 "$XW_SOURCE/scripts/test_package_usb.py"
+          } 2>&1 | tee "$RUNNER_TEMP/host-tests.log"
 
-      - name: Configure, compile and test with Windows MSVC
-        id: host-build-windows
-        if: runner.os == 'Windows'
-        continue-on-error: true
+      - name: Configure, compile and run C tests (MSVC/Ninja)
+        if: matrix.compiler == 'msvc'
         shell: pwsh
+        env:
+          XW_SOURCE: ${{ runner.temp }}/x360-web-total-source
         run: |
-          $ErrorActionPreference = 'Continue'
-          $sourceDir = Join-Path $env:RUNNER_TEMP 'x360-project\browser'
-          $buildDir = Join-Path $env:RUNNER_TEMP 'host-build'
-          $log = Join-Path $env:RUNNER_TEMP 'host-diagnostics.log'
-          $tmp = Join-Path $env:RUNNER_TEMP 'host-command-output.tmp'
-          Set-Content -Path $log -Value ''
-          $script:failed = $false
-          function Invoke-LoggedStep([string]$Label, [string]$Executable, [string[]]$Arguments) {
-            Add-Content -Path $log -Value "`n===== $Label ====="
-            & $Executable @Arguments *> $tmp
-            $code = $LASTEXITCODE
-            if (Test-Path $tmp) { Get-Content $tmp | Add-Content -Path $log }
-            if ($code -eq 0) {
-              Add-Content -Path $log -Value "PASS: $Label"
-            } else {
-              Add-Content -Path $log -Value "ERROR: $Label failed (exit $code)."
-              $script:failed = $true
-            }
-          }
-          Invoke-LoggedStep 'CMake version' 'cmake' @('--version')
-          Invoke-LoggedStep 'CMake configure' 'cmake' @('-S', $sourceDir, '-B', $buildDir, '-G', 'Visual Studio 17 2022', '-A', 'x64')
-          Invoke-LoggedStep 'Host compilation' 'cmake' @('--build', $buildDir, '--config', 'Release', '--parallel', '2')
-          Invoke-LoggedStep 'CTest execution' 'ctest' @('--test-dir', $buildDir, '-C', 'Release', '--output-on-failure', '--no-tests=error')
-          Get-Content $log
-          if ($script:failed) { exit 1 }
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'xw-host-build'
+          cmake -S (Join-Path $env:XW_SOURCE 'browser') -B $build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build $build --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir $build --output-on-failure --no-tests=error
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python (Join-Path $env:XW_SOURCE 'scripts/test_package_usb.py')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload host diagnostics
+      - name: Upload host test log
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: host-diagnostics-${{ matrix.os }}-${{ matrix.cc }}
-          path: |
-            ${{ runner.temp }}/host-diagnostics.log
-            ${{ runner.temp }}/clang-install.log
+          name: host-tests-${{ matrix.compiler }}
+          path: ${{ runner.temp }}/host-tests.log
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Fail host job only after diagnostic upload
-        if: always()
-        shell: bash
-        env:
-          HOST_BUILD_RESULT: ${{ steps.host-build.outcome }}
-          HOST_WINDOWS_RESULT: ${{ steps.host-build-windows.outcome }}
-          CLANG_INSTALL_RESULT: ${{ steps.clang-install.outcome }}
-        run: |
-          set -Eeuo pipefail
-          for result in "$HOST_BUILD_RESULT" "$HOST_WINDOWS_RESULT" "$CLANG_INSTALL_RESULT"; do
-            if [[ "$result" == failure ]]; then
-              echo 'At least one host-platform validation failed; see the uploaded host-diagnostics artifact.'
-              exit 1
-            fi
-          done
-          echo 'Host-platform diagnostics completed.'
-
-  xbox-cross-build:
-    name: LibXenon audit, PowerPC cross-compile and USB packaging
-    needs: discover-source
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+  xenon-build:
+    name: LibXenon PowerPC build and USB package
+    needs: prepare-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - name: Download normalized source
+      - name: Download normalized v0.2.0 source
         uses: actions/download-artifact@v8.0.2
         with:
-          name: x360-web-total-source
-          path: ${{ runner.temp }}/x360-project
+          name: x360-web-total-source-0.2.0
+          path: ${{ runner.temp }}/x360-web-total-source
 
-      - name: Prepare isolated target source and apply compatibility fixes
-        id: prepare
-        continue-on-error: true
-        shell: bash
+      - name: Pull pinned LibXenon toolchain
+        run: docker pull "$LIBXENON_IMAGE"
+
+      - name: Compile xenon.elf for Xbox 360
+        env:
+          XW_SOURCE: ${{ runner.temp }}/x360-web-total-source
         run: |
           set -Eeuo pipefail
-          exec > >(tee -a "$RUNNER_TEMP/prepare-diagnostics.log") 2>&1
-          python3 - <<'PY'
-          import os
-          import re
-          import shutil
-          import sys
+          log="$RUNNER_TEMP/libxenon-build.log"
+          docker run --rm \
+            --volume "$XW_SOURCE/browser:/workspace/browser" \
+            --workdir /workspace/browser \
+            --entrypoint /bin/bash \
+            "$LIBXENON_IMAGE" \
+            -lc 'set -Eeuo pipefail; export DEVKITXENON=/usr/local/xenon; export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"; make clean all DEVKITXENON="$DEVKITXENON"' \
+            2>&1 | tee "$log"
+          test -s "$XW_SOURCE/browser/xenon.elf"
+          python3 - "$XW_SOURCE/browser/xenon.elf" "$XW_SOURCE/scripts" <<'PY'
           from pathlib import Path
-
-          project = Path(os.environ['RUNNER_TEMP']) / 'x360-project'
-          browser = project / 'browser'
-          build = Path(os.environ['RUNNER_TEMP']) / 'x360-browser-build'
-          expected = [
-              'src/main.c', 'src/xw_url.c', 'src/xw_html.c',
-              'src/xw_layout.c', 'src/xw_http_protocol.c', 'src/xw_http_lwip.c',
-              'include/xw_url.h', 'include/xw_html.h', 'include/xw_layout.h',
-              'include/xw_http_client.h', 'include/xw_http_protocol.h',
-              'Makefile', 'CMakeLists.txt',
-          ]
-          problems = [f'browser/{name}' for name in expected if not (browser / name).is_file()]
-          for name in ['scripts/package_usb.py', 'README-INSTALL-PT-BR.txt', 'docs/BOOT-FLOW.md', 'usb/X360WebTotal/config/browser.ini']:
-              if not (project / name).is_file():
-                  problems.append(name)
-          if problems:
-              print('SOURCE PREPARATION ERRORS:')
-              for item in problems:
-                  print(' -', item)
-              sys.exit(2)
-          if build.exists():
-              shutil.rmtree(build)
-          shutil.copytree(browser, build)
-
-          main = build / 'src/main.c'
-          text = main.read_text(encoding='utf-8')
-          if 'dns_tmr(' in text and not re.search(r'(?m)^\s*(?:extern\s+)?void\s+dns_tmr\s*\(\s*void\s*\)\s*;', text):
-              include = '#include <lwip/dns.h>'
-              if include not in text:
-                  print('ERROR: dns_tmr() is called but lwip/dns.h is not included.')
-                  sys.exit(3)
-              text = text.replace(include, include + '\n/* Compatibility declaration for NO_SYS lwIP header variants. */\nextern void dns_tmr(void);', 1)
-              main.write_text(text, encoding='utf-8')
-              print('Applied dns_tmr() declaration compatibility fix to isolated copy.')
-
-          makefile = build / 'Makefile'
-          mk = makefile.read_text(encoding='utf-8')
-          if '-Werror=implicit-function-declaration' not in mk:
-              mk += '\n# CI strictness: fail on undeclared C functions.\nCFLAGS += -Werror=implicit-function-declaration\n'
-              makefile.write_text(mk, encoding='utf-8')
-              print('Enabled strict implicit-function-declaration diagnostics.')
-
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-              env.write(f'XW_PROJECT_ROOT={project}\n')
-              env.write(f'XW_BUILD_BROWSER_DIR={build}\n')
-          print('Isolated PowerPC source copy is ready; original source remains untouched.')
+          import sys
+          sys.path.insert(0, sys.argv[2])
+          import package_usb
+          elf = Path(sys.argv[1])
+          package_usb.validate_elf(elf)
+          print(f'ELF VALID: {elf.stat().st_size} bytes, ELF32 PowerPC big-endian.')
           PY
 
       - name: Download and verify XellLaunch2 2.2.0
-        id: xell
-        continue-on-error: true
-        shell: bash
         run: |
-          set -uo pipefail
-          log="$RUNNER_TEMP/xell-download.log"
-          : > "$log"
-          errors=0
-          url="https://github.com/mitchellwaite/XellLaunch2/releases/download/v${XELL_LAUNCH2_VERSION}/XellLaunch2.xex"
-          echo "Downloading $url" | tee -a "$log"
+          set -Eeuo pipefail
           curl --fail --show-error --location --retry 4 --retry-all-errors \
-            --connect-timeout 20 --max-time 180 "$url" \
-            --output "$RUNNER_TEMP/XellLaunch2.xex" >>"$log" 2>&1
-          curl_rc=$?
-          if (( curl_rc != 0 )); then
-            echo "ERROR: XellLaunch2 download failed (exit $curl_rc)." | tee -a "$log"
-            errors=$((errors + 1))
-          fi
-          if [[ ! -s "$RUNNER_TEMP/XellLaunch2.xex" ]]; then
-            echo 'ERROR: XellLaunch2.xex is absent or empty after download.' | tee -a "$log"
-            errors=$((errors + 1))
-          else
-            printf '%s  %s\n' "$XELL_LAUNCH2_SHA256" "$RUNNER_TEMP/XellLaunch2.xex" | sha256sum --check >>"$log" 2>&1
-            hash_rc=$?
-            if (( hash_rc != 0 )); then
-              echo "ERROR: XellLaunch2 SHA-256 verification failed (exit $hash_rc)." | tee -a "$log"
-              errors=$((errors + 1))
-            else
-              echo 'PASS: XellLaunch2 2.2.0 SHA-256 verified.' | tee -a "$log"
-            fi
-          fi
-          cat "$log"
-          if (( errors > 0 )); then exit 1; fi
+            --connect-timeout 20 --max-time 180 \
+            "$XELL_LAUNCH2_URL" --output "$RUNNER_TEMP/XellLaunch2.xex"
+          echo "$XELL_LAUNCH2_SHA256  $RUNNER_TEMP/XellLaunch2.xex" | sha256sum --check
 
-      - name: Run full LibXenon diagnostics and keep-going cross-build
-        id: cross
-        continue-on-error: true
-        shell: bash
+      - name: Create and verify FAT32 USB package
+        env:
+          XW_SOURCE: ${{ runner.temp }}/x360-web-total-source
         run: |
-          set -uo pipefail
-          exec > >(tee -a "$RUNNER_TEMP/xbox-cross-step.log") 2>&1
-          if [[ ! -d "${XW_BUILD_BROWSER_DIR:-}" ]]; then
-            echo 'ERROR: isolated browser source directory is missing.' | tee "$RUNNER_TEMP/cross-diagnostics.txt"
-            exit 1
-          fi
-          docker --version
-          pull_log="$RUNNER_TEMP/docker-pull.log"
-          docker pull "$LIBXENON_IMAGE" >"$pull_log" 2>&1
-          pull_rc=$?
-          cat "$pull_log"
-          if (( pull_rc != 0 )); then
-            echo "WARNING: docker pull returned $pull_rc; checking whether the image is already cached."
-          fi
-          if ! docker image inspect "$LIBXENON_IMAGE" >/dev/null 2>&1; then
-            echo 'ERROR: LibXenon Docker image is unavailable after pull.' | tee "$RUNNER_TEMP/cross-diagnostics.txt"
-            exit 1
-          fi
+          set -Eeuo pipefail
+          python3 "$XW_SOURCE/scripts/package_usb.py" \
+            --elf "$XW_SOURCE/browser/xenon.elf" \
+            --xell "$RUNNER_TEMP/XellLaunch2.xex" \
+            --project "$XW_SOURCE" \
+            --output "$RUNNER_TEMP/X360-Web-Total-USB.zip"
 
-          cat > "$RUNNER_TEMP/x360-cross-build.sh" <<'CONTAINER_SCRIPT'
-          #!/usr/bin/env bash
-          set -uo pipefail
-          DEVKITXENON="${DEVKITXENON:-/usr/local/xenon}"
-          export DEVKITXENON
-          export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"
-          LOG=/ci/cross-build.log
-          DIAG=/ci/cross-diagnostics.txt
-          : > "$LOG"
-          : > "$DIAG"
-          failures=0
-          issue() {
-            printf 'ERROR: %s\n' "$1" | tee -a "$DIAG"
-            failures=$((failures + 1))
-          }
-          run_logged() {
-            label="$1"
-            logfile="$2"
-            shift 2
-            echo "===== $label =====" | tee -a "$LOG"
-            "$@" >"$logfile" 2>&1
-            rc=$?
-            {
-              echo "===== OUTPUT: $label (exit $rc) ====="
-              if [[ -f "$logfile" ]]; then cat "$logfile"; fi
-            } >> "$LOG"
-            if (( rc != 0 )); then
-              issue "$label failed (exit $rc). Full output is saved in $logfile and cross-build.log."
-            else
-              echo "PASS: $label" | tee -a "$LOG"
-            fi
-            return 0
-          }
-          echo "LibXenon prefix: $DEVKITXENON" | tee -a "$LOG"
-
-          for tool in make git xenon-gcc xenon-objcopy xenon-strip xenon-ar; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-              issue "required command not found: $tool"
-            else
-              printf 'FOUND: %s -> %s\n' "$tool" "$(command -v "$tool")" | tee -a "$LOG"
-            fi
-          done
-          if [[ ! -s "$DEVKITXENON/app.lds" ]]; then
-            issue "required linker script missing: $DEVKITXENON/app.lds"
-          fi
-          if command -v xenon-gcc >/dev/null 2>&1; then
-            target=$(xenon-gcc -dumpmachine 2>&1)
-            echo "xenon-gcc target: $target" | tee -a "$LOG"
-            case "$target" in *xenon*|*powerpc*) ;; *) issue "xenon-gcc reports unexpected target '$target'" ;; esac
-          fi
-
-          # The upstream image installs libxenon in $DEVKITXENON/usr/lib.
-          # Do not search the incorrect /usr/lib/32 location.
-          if [[ ! -s "$DEVKITXENON/usr/lib/libxenon.a" ]]; then
-            existing=$(find "$DEVKITXENON" -type f -name libxenon.a -print -quit 2>/dev/null)
-            if [[ -n "$existing" ]]; then
-              mkdir -p "$DEVKITXENON/usr/lib"
-              cp "$existing" "$DEVKITXENON/usr/lib/libxenon.a"
-              echo "Normalized libxenon archive from: $existing" | tee -a "$LOG"
-            else
-              echo 'libxenon.a not found; invoking the upstream LibXenon library installer.' | tee -a "$LOG"
-              run_logged 'Clone official LibXenon sources' /ci/clone-libxenon.log \
-                git clone --depth 1 https://github.com/Free60Project/libxenon.git /tmp/free60-libxenon
-              if [[ -d /tmp/free60-libxenon/toolchain && -f /tmp/free60-libxenon/toolchain/build-xenon-toolchain ]]; then
-                run_logged 'Build and install libxenon using upstream script' /ci/install-libxenon.log \
-                  env PREFIX="$DEVKITXENON" PARALLEL=-j2 bash /tmp/free60-libxenon/toolchain/build-xenon-toolchain libxenon
-              else
-                issue 'official LibXenon source checkout did not provide toolchain/build-xenon-toolchain'
-              fi
-            fi
-          fi
-
-          # The application uses the separate Free60Project/libfat API; the
-          # libxenon image does not promise this exact header/archive pair.
-          if [[ ! -s "$DEVKITXENON/usr/include/libfat/fat.h" || ! -s "$DEVKITXENON/usr/lib/libfat.a" ]]; then
-            echo 'libfat is incomplete; building the official Free60Project/libfat port.' | tee -a "$LOG"
-            if [[ ! -s "$DEVKITXENON/rules" ]]; then
-              issue "cannot build libfat because the devkit rules file is missing: $DEVKITXENON/rules"
-            fi
-            run_logged 'Clone official libfat sources' /ci/clone-libfat.log \
-              git clone --depth 1 https://github.com/Free60Project/libfat.git /tmp/free60-libfat
-            if [[ -f /tmp/free60-libfat/Makefile ]]; then
-              run_logged 'Compile libfat for Xenon' /ci/build-libfat.log \
-                make --jobs=2 -C /tmp/free60-libfat xenon-release DEVKITXENON="$DEVKITXENON"
-              run_logged 'Install libfat headers and archive' /ci/install-libfat.log \
-                make -C /tmp/free60-libfat install DEVKITXENON="$DEVKITXENON"
-            else
-              issue 'official libfat source tree or root Makefile is missing'
-            fi
-          fi
-
-          required_headers=(
-            console/console.h diskio/ata.h diskio/disc_io.h input/input.h
-            network/network.h time/time.h usb/usbmain.h
-            xenon_soc/xenon_power.h xenos/xenos.h
-            lwip/dns.h lwip/err.h lwip/ip_addr.h lwip/pbuf.h lwip/tcp.h
-            libfat/fat.h
-          )
-          for header in "${required_headers[@]}"; do
-            if [[ ! -s "$DEVKITXENON/usr/include/$header" ]]; then
-              issue "required header missing: $DEVKITXENON/usr/include/$header"
-            fi
-          done
-          required_libraries=(
-            "$DEVKITXENON/usr/lib/libxenon.a"
-            "$DEVKITXENON/usr/lib/libfat.a"
-          )
-          for library in "${required_libraries[@]}"; do
-            if [[ ! -s "$library" ]]; then issue "required static library missing: $library"; fi
-          done
-
-          if command -v xenon-gcc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
-            echo '===== Keep-going Xenon compile and link =====' | tee -a "$LOG"
-            make -C /app clean DEVKITXENON="$DEVKITXENON" >>"$LOG" 2>&1
-            clean_rc=$?
-            if (( clean_rc != 0 )); then issue "make clean failed (exit $clean_rc)"; fi
-            make --keep-going --jobs=2 -C /app all DEVKITXENON="$DEVKITXENON" >>"$LOG" 2>&1
-            build_rc=$?
-            if (( build_rc != 0 )); then issue "LibXenon compile/link failed (exit $build_rc); make --keep-going collected errors across independent C files."; fi
-          else
-            issue 'cross-build skipped because xenon-gcc or make is unavailable'
-          fi
-
-          if [[ -s /app/xenon.elf ]]; then
-            cp /app/xenon.elf /ci/xenon.elf
-            echo "ELF copied to CI workspace ($(wc -c < /app/xenon.elf) bytes)." | tee -a "$LOG"
-          else
-            issue 'xenon.elf was not produced by the cross-build'
-          fi
-
-          echo "Total LibXenon diagnostics: $failures" | tee -a "$DIAG"
-          echo "Full build log: /ci/cross-build.log" | tee -a "$DIAG"
-          if (( failures > 0 )); then exit 1; fi
-          exit 0
-          CONTAINER_SCRIPT
-
-          docker run --rm \
-            --volume "$XW_BUILD_BROWSER_DIR:/app" \
-            --volume "$RUNNER_TEMP:/ci" \
-            --workdir /app \
-            --env DEVKITXENON=/usr/local/xenon \
-            --entrypoint /bin/bash "$LIBXENON_IMAGE" /ci/x360-cross-build.sh
-          run_rc=$?
-          if [[ -f "$RUNNER_TEMP/cross-build.log" ]]; then cat "$RUNNER_TEMP/cross-build.log"; fi
-          if [[ -f "$RUNNER_TEMP/cross-diagnostics.txt" ]]; then cat "$RUNNER_TEMP/cross-diagnostics.txt"; fi
-          exit "$run_rc"
-
-      - name: Validate ELF, package USB files and collect packaging diagnostics
-        id: package
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -uo pipefail
-          exec > >(tee -a "$RUNNER_TEMP/package-step.log") 2>&1
-          python3 - <<'PY'
-          import hashlib
-          import os
-          import struct
-          import subprocess
-          import sys
-          import zipfile
-          from pathlib import Path
-
-          temp = Path(os.environ['RUNNER_TEMP'])
-          project = temp / 'x360-project'
-          elf = temp / 'xenon.elf'
-          xell = temp / 'XellLaunch2.xex'
-          output = Path(os.environ['GITHUB_WORKSPACE']) / 'X360-Web-Total-USB.zip'
-          expected_xell = os.environ['XELL_LAUNCH2_SHA256'].lower()
-          issues = []
-          try:
-              output.unlink()
-          except FileNotFoundError:
-              pass
-
-          if not project.is_dir():
-              issues.append(f'normalized project directory is missing: {project}')
-          else:
-              for name in ['scripts/package_usb.py', 'README-INSTALL-PT-BR.txt', 'docs/BOOT-FLOW.md', 'usb/X360WebTotal/config/browser.ini']:
-                  if not (project / name).is_file():
-                      issues.append(f'packaging input is missing: {name}')
-
-          if not elf.is_file() or elf.stat().st_size == 0:
-              issues.append('xenon.elf is missing or empty; target build did not produce a payload')
-          else:
-              data = elf.read_bytes()
-              if len(data) < 52:
-                  issues.append(f'ELF header is truncated ({len(data)} bytes)')
-              elif data[:4] != b'\x7fELF':
-                  issues.append('ELF magic is invalid')
-              else:
-                  if data[4] != 1: issues.append('ELF class is not ELF32')
-                  if data[5] != 2: issues.append('ELF byte order is not big-endian')
-                  if data[6] != 1: issues.append('ELF identification version is invalid')
-                  elf_type, machine, version = struct.unpack_from('>HHI', data, 16)
-                  if elf_type != 2: issues.append(f'ELF type is not ET_EXEC (found {elf_type})')
-                  if machine != 20: issues.append(f'ELF machine is not EM_PPC (found {machine})')
-                  if version != 1: issues.append(f'ELF header version is invalid ({version})')
-                  entry, phoff, shoff = struct.unpack_from('>III', data, 24)
-                  ehsize, phentsize, phnum, shentsize, shnum, shstrndx = struct.unpack_from('>HHHHHH', data, 40)
-                  if ehsize != 52: issues.append(f'ELF header size should be 52, found {ehsize}')
-                  if entry == 0: issues.append('ELF entry point is zero')
-                  if phnum == 0 or phentsize < 32 or phoff == 0: issues.append('ELF has no valid program-header table')
-                  elif phoff + phentsize * phnum > len(data): issues.append('ELF program-header table exceeds file size')
-                  if shnum and (shentsize < 40 or shoff == 0 or shoff + shentsize * shnum > len(data)):
-                      issues.append('ELF section-header table is invalid or truncated')
-                  if not any('ELF' in item for item in issues):
-                      print(f'ELF validation passed: {len(data)} bytes, ELF32 big-endian PowerPC.')
-
-          if not xell.is_file() or xell.stat().st_size == 0:
-              issues.append('XellLaunch2.xex was not downloaded')
-          else:
-              actual = hashlib.sha256(xell.read_bytes()).hexdigest()
-              if actual != expected_xell:
-                  issues.append(f'XellLaunch2 SHA-256 mismatch: expected {expected_xell}, found {actual}')
-              else:
-                  print('XellLaunch2 2.2.0 SHA-256 verified.')
-
-          package_inputs = [
-              project / 'scripts/package_usb.py',
-              project / 'usb/X360WebTotal/config/browser.ini',
-              project / 'README-INSTALL-PT-BR.txt',
-              project / 'docs/BOOT-FLOW.md',
-          ] if project.is_dir() else []
-          can_run_packager = (
-              elf.is_file() and elf.stat().st_size > 0
-              and xell.is_file() and xell.stat().st_size > 0
-              and project.is_dir()
-              and (project / 'scripts/package_usb.py').is_file()
-          )
-          if can_run_packager:
-              # Run packaging even when a separate strict ELF/hash check has
-              # already reported an issue, so independent package diagnostics
-              # are not hidden behind the first failure.
-              command = [
-                  sys.executable, str(project / 'scripts/package_usb.py'),
-                  '--elf', str(elf), '--xell', str(xell),
-                  '--project', str(project), '--output', str(output),
-              ]
-              result = subprocess.run(command, text=True, capture_output=True)
-              print(result.stdout, end='')
-              if result.stderr:
-                  print(result.stderr, file=sys.stderr, end='')
-              if result.returncode:
-                  issues.append(f'USB packager exited with code {result.returncode}')
-          else:
-              if not elf.is_file() or elf.stat().st_size == 0:
-                  print('Packager skipped: no non-empty ELF input is available.')
-              elif not xell.is_file() or xell.stat().st_size == 0:
-                  print('Packager skipped: no non-empty XellLaunch2 input is available.')
-              else:
-                  missing_inputs = [str(path.relative_to(project)) for path in package_inputs if not path.is_file()]
-                  for item in missing_inputs:
-                      issues.append(f'packager input missing: {item}')
-
-          if output.is_file() and output.stat().st_size:
-              try:
-                  with zipfile.ZipFile(output) as archive:
-                      bad = archive.testzip()
-                      if bad:
-                          issues.append(f'ZIP CRC check failed at {bad}')
-                      names = set(archive.namelist())
-                      required = {
-                          'xenon.elf', 'XellLaunch2.xex', 'LEIA-ME.txt',
-                          'FLUXO-DE-INICIALIZACAO.txt', 'SHA256SUMS.txt',
-                          'VERSION.txt', 'X360WebTotal/config/browser.ini',
-                          'X360WebTotal/data/.keep', 'X360WebTotal/cache/.keep',
-                          'X360WebTotal/logs/.keep',
-                      }
-                      for name in sorted(required - names):
-                          issues.append(f'USB ZIP member missing: {name}')
-                      for name in sorted(names):
-                          path = Path(name)
-                          if path.is_absolute() or '..' in path.parts:
-                              issues.append(f'unsafe path in USB ZIP: {name}')
-                          if len(name) > 240:
-                              issues.append(f'path exceeds portability limit: {name}')
-                      if 'SHA256SUMS.txt' in names:
-                          for line in archive.read('SHA256SUMS.txt').decode('ascii').splitlines():
-                              try:
-                                  digest, filename = line.split('  ', 1)
-                                  actual = hashlib.sha256(archive.read(filename)).hexdigest()
-                                  if actual.lower() != digest.lower():
-                                      issues.append(f'package SHA-256 mismatch: {filename}')
-                              except Exception as exc:
-                                  issues.append(f'invalid SHA256SUMS.txt entry: {line!r}: {exc}')
-                  if not issues:
-                      print(f'USB package passed CRC, required-file, path and SHA-256 checks: {output.stat().st_size} bytes.')
-              except (OSError, zipfile.BadZipFile) as exc:
-                  issues.append(f'USB ZIP could not be read: {exc}')
-          else:
-              issues.append('X360-Web-Total-USB.zip was not created')
-
-          if issues:
-              diagnostic = temp / 'package-diagnostics.txt'
-              diagnostic.write_text('\n'.join(f'ERROR: {item}' for item in issues) + '\n', encoding='utf-8')
-              print('PACKAGING AUDIT FOUND ALL OF THESE ISSUES:')
-              for item in issues:
-                  print(' -', item)
-              sys.exit(1)
-          print('All packaging checks passed.')
-          PY
-
-      - name: Upload USB package
-        if: always() && hashFiles('X360-Web-Total-USB.zip') != ''
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: X360-Web-Total-USB
-          path: X360-Web-Total-USB.zip
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload full diagnostic bundle
+      - name: Upload LibXenon diagnostics
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: X360-Web-Total-diagnostics
-          path: |
-            ${{ runner.temp }}/cross-build.log
-            ${{ runner.temp }}/cross-diagnostics.txt
-            ${{ runner.temp }}/package-diagnostics.txt
-            ${{ runner.temp }}/docker-pull.log
-            ${{ runner.temp }}/xell-download.log
-            ${{ runner.temp }}/prepare-diagnostics.log
-            ${{ runner.temp }}/xbox-cross-step.log
-            ${{ runner.temp }}/package-step.log
-            ${{ runner.temp }}/clone-*.log
-            ${{ runner.temp }}/install-*.log
-            ${{ runner.temp }}/build-libfat.log
+          name: x360-web-total-0.2.0-libxenon-diagnostics
+          path: ${{ runner.temp }}/libxenon-build.log
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Publish cross-build result summary
+      - name: Upload final USB package and ELF
+        if: success()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: X360-Web-Total-0.2.0-USB
+          path: |
+            ${{ runner.temp }}/X360-Web-Total-USB.zip
+            ${{ runner.temp }}/x360-web-total-source/browser/xenon.elf
+            ${{ runner.temp }}/XellLaunch2.xex
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish build summary
         if: always()
-        shell: bash
-        env:
-          PREPARE_RESULT: ${{ steps.prepare.outcome }}
-          XELL_RESULT: ${{ steps.xell.outcome }}
-          CROSS_RESULT: ${{ steps.cross.outcome }}
-          PACKAGE_RESULT: ${{ steps.package.outcome }}
         run: |
           {
-            echo '## X360 Web Total — diagnostic summary'
+            echo '## X360 Web Total 0.2.0'
             echo
-            echo "- Source preparation: ${PREPARE_RESULT:-unknown}"
-            echo "- XellLaunch2 download and SHA-256: ${XELL_RESULT:-unknown}"
-            echo "- LibXenon cross-compile: ${CROSS_RESULT:-unknown}"
-            echo "- ELF and USB package validation: ${PACKAGE_RESULT:-unknown}"
-            echo
-            echo 'The diagnostic artifact contains the complete compiler output and all collected prerequisite errors.'
-            echo 'The USB ZIP contains a XeLL-loadable ELF payload; it is not a native dashboard XEX.'
+            echo '- Source: exact VERSION 0.2.0 and SHA-256 manifest validated.'
+            echo '- Host checks run independently from the PowerPC build.'
+            echo '- Target output: `xenon.elf` (LibXenon ELF32, big-endian PowerPC).'
+            echo '- Launcher: XellLaunch2 2.2.0, pinned SHA-256 verified.'
+            echo '- USB package: FAT32-ready folder structure, ZIP CRC and SHA-256 inventory verified.'
+            echo '- `xenon.elf` is a XeLL payload, not a dashboard-native XEX.'
+            echo '- A successful CI build still requires a physical RGH/JTAG console test.'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Fail only after all independent diagnostics finish
-        if: always()
-        shell: bash
-        env:
-          PREPARE_RESULT: ${{ steps.prepare.outcome }}
-          XELL_RESULT: ${{ steps.xell.outcome }}
-          CROSS_RESULT: ${{ steps.cross.outcome }}
-          PACKAGE_RESULT: ${{ steps.package.outcome }}
-        run: |
-          set -Eeuo pipefail
-          failed=0
-          for result in "$PREPARE_RESULT" "$XELL_RESULT" "$CROSS_RESULT" "$PACKAGE_RESULT"; do
-            if [[ "$result" != success ]]; then failed=1; fi
-          done
-          if (( failed )); then
-            echo 'The full diagnostic run completed, but at least one required process failed.'
-            exit 1
-          fi
-          echo 'Every required preparation, download, cross-compile and packaging process passed.'
 
   final-report:
-    name: Consolidated multi-platform result
-    needs: [discover-source, host-tests, xbox-cross-build]
-    if: always()
-    runs-on: ubuntu-latest
+    name: Consolidated validation result
+    if: ${{ always() }}
+    needs: [prepare-source, host-tests, xenon-build]
+    runs-on: ubuntu-24.04
     steps:
-      - name: Report every job result
-        shell: bash
+      - name: Report job results
         env:
-          DISCOVER_RESULT: ${{ needs.discover-source.result }}
+          SOURCE_RESULT: ${{ needs.prepare-source.result }}
           HOST_RESULT: ${{ needs.host-tests.result }}
-          XBOX_RESULT: ${{ needs.xbox-cross-build.result }}
+          XENON_RESULT: ${{ needs.xenon-build.result }}
         run: |
-          set -uo pipefail
           {
-            echo '## Final X360 Web Total CI report'
+            echo '## X360 Web Total 0.2.0 - final result'
             echo
-            echo "- Source discovery and archive audit: ${DISCOVER_RESULT}"
-            echo "- Multi-platform host tests (Linux GCC, Linux Clang, macOS Clang, Windows MSVC): ${HOST_RESULT}"
-            echo "- LibXenon PowerPC build and USB packaging: ${XBOX_RESULT}"
-            echo
-            echo 'See the X360-Web-Total-diagnostics artifact for compiler and packaging details.'
+            echo "- Source validation: $SOURCE_RESULT"
+            echo "- Host tests: $HOST_RESULT"
+            echo "- LibXenon build and USB packaging: $XENON_RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$DISCOVER_RESULT" != success || "$HOST_RESULT" != success || "$XBOX_RESULT" != success ]]; then
-            echo 'One or more CI jobs failed. Review the full diagnostic artifacts before changing source code.'
+          if [[ "$SOURCE_RESULT" != success || "$HOST_RESULT" != success || "$XENON_RESULT" != success ]]; then
+            echo 'At least one required validation job failed. Open its diagnostic artifact.'
             exit 1
           fi
-          echo 'All discovery, host-platform and Xbox cross-build jobs passed.'
+          echo 'All source, host, PowerPC and package validations passed.'
