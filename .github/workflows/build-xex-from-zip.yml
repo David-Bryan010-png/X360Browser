@@ -253,119 +253,137 @@ jobs:
           set -Eeuo pipefail
           ctest --test-dir "$RUNNER_TEMP/xw-host-build" --output-on-failure --no-tests=error
 
-      - name: Prepare and verify LibXenon build image
+      - name: Prepare and verify official LibXenon image
         shell: bash
         run: |
           set -Eeuo pipefail
           docker --version
           docker pull "$LIBXENON_IMAGE"
-          context="$RUNNER_TEMP/x360-libxenon-image"
-          mkdir -p "$context"
-          cat > "$context/setup-libxenon.sh" <<'CONTAINER_SCRIPT'
-          #!/bin/sh
-          set -eu
-          prefix="${DEVKITXENON:-/usr/local/xenon}"
-          if [ ! -x "$prefix/bin/xenon-gcc" ]; then
-            compiler="$(command -v xenon-gcc 2>/dev/null || true)"
-            if [ -n "$compiler" ]; then
-              prefix="$(dirname "$(dirname "$compiler")")"
-            else
-              for candidate in /usr/local/xenon /opt/xenon /root/x360/devkitxenon /xenon; do
-                if [ -x "$candidate/bin/xenon-gcc" ]; then prefix="$candidate"; break; fi
-              done
-            fi
-          fi
-          [ -x "$prefix/bin/xenon-gcc" ] || { echo "ERROR: xenon-gcc not found" >&2; exit 10; }
-          export DEVKITXENON="$prefix"
-          export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"
+          cat > "$RUNNER_TEMP/check-libxenon.sh" <<'CONTAINER_SCRIPT'
+          set -euo pipefail
+          export DEVKITXENON="${DEVKITXENON:-/usr/local/xenon}"
+          export PATH="$PATH:$DEVKITXENON/bin:$DEVKITXENON/usr/bin"
           for tool in xenon-gcc xenon-objcopy xenon-strip; do
-            command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing $tool" >&2; exit 11; }
+            command -v "$tool" >/dev/null 2>&1 || {
+              echo "ERROR: $tool was not found in the official LibXenon image" >&2
+              exit 10
+            }
           done
-          test -f "$DEVKITXENON/app.lds" || { echo "ERROR: app.lds missing" >&2; exit 12; }
-          test -f "$DEVKITXENON/rules" || { echo "ERROR: LibXenon rules missing" >&2; exit 12; }
-
-          # Ensure the separate FAT library is present in this derived image.
-          if [ ! -f "$DEVKITXENON/usr/include/libfat/fat.h" ] || [ ! -s "$DEVKITXENON/usr/lib/libfat.a" ]; then
-            command -v git >/dev/null 2>&1 || { echo "ERROR: git is required to build libfat" >&2; exit 13; }
-            rm -rf /tmp/x360-libfat
-            git clone --depth 1 https://github.com/Free60Project/libfat.git /tmp/x360-libfat
-            make -C /tmp/x360-libfat xenon-release
-            make -C /tmp/x360-libfat/libxenon install
-          fi
-
+          test -s "$DEVKITXENON/app.lds" || {
+            echo "ERROR: missing linker script: $DEVKITXENON/app.lds" >&2
+            exit 11
+          }
           for header in \
             console/console.h diskio/ata.h input/input.h libfat/fat.h \
             network/network.h time/time.h usb/usbmain.h \
             xenon_soc/xenon_power.h xenos/xenos.h \
-            lwip/dns.h lwip/tcp.h lwip/pbuf.h; do
-            test -f "$DEVKITXENON/usr/include/$header" || {
-              echo "ERROR: required header missing: $DEVKITXENON/usr/include/$header" >&2
-              exit 14
+            lwip/dns.h lwip/err.h lwip/ip_addr.h lwip/pbuf.h lwip/tcp.h; do
+            test -s "$DEVKITXENON/usr/include/$header" || {
+              echo "ERROR: missing required header: $DEVKITXENON/usr/include/$header" >&2
+              exit 12
             }
           done
-          test -s "$DEVKITXENON/usr/lib/libfat.a" || { echo "ERROR: libfat.a missing after installation" >&2; exit 15; }
-          test -s "$DEVKITXENON/xenon/lib/32/libxenon.a" || test -s "$DEVKITXENON/usr/lib/libxenon.a" || {
-            echo "ERROR: libxenon.a missing from linker paths" >&2
-            exit 16
+          test -s "$DEVKITXENON/usr/lib/libfat.a" || {
+            echo "ERROR: libfat.a is absent. The official LibXenon image must include auxiliary filesystem libraries." >&2
+            exit 13
           }
-          echo "LibXenon + libfat verified at $DEVKITXENON"
+          test -s "$DEVKITXENON/xenon/lib/32/libxenon.a" || {
+            echo "ERROR: libxenon.a is absent from $DEVKITXENON/xenon/lib/32" >&2
+            exit 14
+          }
           xenon-gcc --version | head -n 1
+          echo "LibXenon toolchain, linker script, lwIP headers, libfat and libxenon verified."
           CONTAINER_SCRIPT
-          cat > "$context/Dockerfile" <<DOCKERFILE
-          FROM ${LIBXENON_IMAGE}
-          ENV DEVKITXENON=/usr/local/xenon
-          ENV PATH=/usr/local/xenon/bin:/usr/local/xenon/usr/bin:${PATH}
-          COPY setup-libxenon.sh /tmp/setup-libxenon.sh
-          RUN /bin/sh /tmp/setup-libxenon.sh && rm -f /tmp/setup-libxenon.sh
-          DOCKERFILE
-          docker build --pull=false --tag x360-web-total-libxenon:ci "$context"
-          docker run --rm --entrypoint /bin/sh x360-web-total-libxenon:ci -c 'command -v xenon-gcc >/dev/null && command -v xenon-objcopy >/dev/null && command -v xenon-strip >/dev/null'
-          echo 'LIBXENON_BUILD_IMAGE=x360-web-total-libxenon:ci' >> "$GITHUB_ENV"
+          docker run --rm -i \
+            --env DEVKITXENON=/usr/local/xenon \
+            --entrypoint /bin/bash "$LIBXENON_IMAGE" -s \
+            < "$RUNNER_TEMP/check-libxenon.sh"
 
       - name: Preflight LibXenon compiler commands
         shell: bash
         run: |
           set -Eeuo pipefail
           cat > "$RUNNER_TEMP/make-preflight.sh" <<'CONTAINER_SCRIPT'
-          set -eu
-          prefix="${DEVKITXENON:-/usr/local/xenon}"
-          if [ ! -x "$prefix/bin/xenon-gcc" ]; then
-            compiler="$(command -v xenon-gcc 2>/dev/null || true)"
-            [ -n "$compiler" ] || { echo "ERROR: xenon-gcc not found" >&2; exit 10; }
-            prefix="$(dirname "$(dirname "$compiler")")"
-          fi
-          export DEVKITXENON="$prefix"
-          export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"
-          make clean
-          make --dry-run all DEVKITXENON="$DEVKITXENON" > /out/make-plan.txt
-          test -s /out/make-plan.txt
+          set -euo pipefail
+          export DEVKITXENON="${DEVKITXENON:-/usr/local/xenon}"
+          export PATH="$PATH:$DEVKITXENON/bin:$DEVKITXENON/usr/bin"
+          command -v xenon-gcc >/dev/null 2>&1
+          make clean >/dev/null
+          make --no-print-directory --dry-run all DEVKITXENON="$DEVKITXENON"
           CONTAINER_SCRIPT
-          docker run --rm \
+          plan="$RUNNER_TEMP/make-plan.txt"
+          errors="$RUNNER_TEMP/make-preflight.stderr"
+          if docker run --rm -i \
             --volume "$XW_BUILD_BROWSER_DIR:/app" \
-            --volume "$RUNNER_TEMP:/out" \
             --workdir /app \
-            --entrypoint /bin/sh "$LIBXENON_BUILD_IMAGE" -s < "$RUNNER_TEMP/make-preflight.sh"
-          python3 - <<'PY'
-          import os
-          import re
+            --env DEVKITXENON=/usr/local/xenon \
+            --entrypoint /bin/bash "$LIBXENON_IMAGE" -s \
+            < "$RUNNER_TEMP/make-preflight.sh" > "$plan" 2> "$errors"; then
+            if [[ -s "$errors" ]]; then cat "$errors"; fi
+          else
+            status=$?
+            echo "LibXenon make preflight failed (exit $status). Diagnostics:" >&2
+            [[ ! -s "$errors" ]] || cat "$errors" >&2
+            [[ ! -s "$plan" ]] || tail -n 100 "$plan" >&2
+            exit "$status"
+          fi
+          if [[ ! -s "$plan" ]]; then
+            echo "ERROR: Docker returned an empty make dry-run plan; no mounted output file is used." >&2
+            exit 20
+          fi
+          python3 - "$plan" <<'PY'
+          import shlex
+          import sys
           from pathlib import Path
 
-          plan_path = Path(os.environ["RUNNER_TEMP"]) / "make-plan.txt"
+          plan_path = Path(sys.argv[1])
           plan = plan_path.read_text(encoding="utf-8", errors="replace")
-          required_flags = (
+          required_flags = {
+              "-DXENON", "-m32", "-mcpu=cell", "-mtune=cell", "-maltivec",
               "-fno-pic", "-fno-strict-aliasing", "-O2", "-Wall", "-Wextra",
               "-std=gnu99", "-Werror=implicit-function-declaration",
-          )
-          missing = [flag for flag in required_flags if flag not in plan]
-          if missing:
-              raise SystemExit("Compiler dry-run is missing flags: " + ", ".join(missing))
-          malformed = re.findall(r"(?<!\S)(?:-fno-|-02|Wall|-I)(?=\s|$)", plan)
-          if malformed:
-              raise SystemExit("Malformed compiler tokens found: " + ", ".join(malformed))
-          commands = re.findall(r"(?m)^.*xenon-gcc\s+.*\s-c\s+src/[^\s]+\.c\s+-o\s+build/[^\s]+\.o\s*$", plan)
-          if len(commands) != 6:
-              raise SystemExit(f"Expected 6 C compile commands, found {len(commands)}")
-          print(f"Compiler preflight passed: {len(commands)} C translation units; all required flags present.")
+          }
+          expected_sources = {
+              "src/main.c", "src/xw_url.c", "src/xw_html.c",
+              "src/xw_layout.c", "src/xw_http_protocol.c", "src/xw_http_lwip.c",
+          }
+          found = {}
+          bad_tokens = {"-fno-", "-02", "Wall", "-I"}
+          for line in plan.splitlines():
+              try:
+                  tokens = shlex.split(line)
+              except ValueError:
+                  continue
+              if not any(Path(token).name == "xenon-gcc" for token in tokens):
+                  continue
+              if "-c" not in tokens:
+                  continue
+              bad = sorted(set(tokens) & bad_tokens)
+              if bad:
+                  raise SystemExit("Malformed compiler token(s): " + ", ".join(bad))
+              missing_flags = sorted(flag for flag in required_flags if flag not in tokens)
+              if missing_flags:
+                  raise SystemExit("Compiler command lacks flags: " + ", ".join(missing_flags))
+              try:
+                  source = tokens[tokens.index("-c") + 1]
+                  output = tokens[tokens.index("-o") + 1]
+              except (ValueError, IndexError):
+                  raise SystemExit("Malformed xenon-gcc compile command: " + line)
+              if source in found:
+                  raise SystemExit("Duplicate compile command for " + source)
+              found[source] = output
+
+          missing_sources = sorted(expected_sources - found.keys())
+          extra_sources = sorted(found.keys() - expected_sources)
+          if missing_sources or extra_sources:
+              raise SystemExit(
+                  f"Unexpected compile plan. Missing={missing_sources}; extra={extra_sources}"
+              )
+          for source, output in found.items():
+              expected_output = "build/" + Path(source).stem + ".o"
+              if output != expected_output:
+                  raise SystemExit(f"Wrong object output for {source}: {output}")
+          print(f"Compiler preflight passed: {len(found)} unique C files and all Xenon flags verified.")
           PY
 
       - name: Build LibXenon ELF
@@ -373,36 +391,36 @@ jobs:
         run: |
           set -Eeuo pipefail
           cat > "$RUNNER_TEMP/build-libxenon.sh" <<'CONTAINER_SCRIPT'
-          set -eu
-          prefix="${DEVKITXENON:-/usr/local/xenon}"
-          if [ ! -x "$prefix/bin/xenon-gcc" ]; then
-            compiler="$(command -v xenon-gcc 2>/dev/null || true)"
-            [ -n "$compiler" ] || { echo "ERROR: xenon-gcc not found" >&2; exit 10; }
-            prefix="$(dirname "$(dirname "$compiler")")"
-          fi
-          export DEVKITXENON="$prefix"
-          export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"
+          set -euo pipefail
+          export DEVKITXENON="${DEVKITXENON:-/usr/local/xenon}"
+          export PATH="$PATH:$DEVKITXENON/bin:$DEVKITXENON/usr/bin"
           make clean
           make --jobs=2 all DEVKITXENON="$DEVKITXENON"
           test -s xenon.elf
-          cp xenon.elf /out/xenon.elf
-          echo "Cross-build complete: $(wc -c < /out/xenon.elf) bytes"
+          echo "Cross-build produced xenon.elf ($(wc -c < xenon.elf) bytes)."
           CONTAINER_SCRIPT
           log="$RUNNER_TEMP/x360-web-total-cross-build.log"
-          if docker run --rm \
+          if docker run --rm -i \
             --volume "$XW_BUILD_BROWSER_DIR:/app" \
-            --volume "$RUNNER_TEMP:/out" \
             --workdir /app \
-            --entrypoint /bin/sh "$LIBXENON_BUILD_IMAGE" -s \
+            --env DEVKITXENON=/usr/local/xenon \
+            --entrypoint /bin/bash "$LIBXENON_IMAGE" -s \
             < "$RUNNER_TEMP/build-libxenon.sh" > "$log" 2>&1; then
             cat "$log"
           else
             status=$?
-            echo "LibXenon build failed (exit $status). Last 160 log lines:"
-            tail -n 160 "$log" || true
+            echo "LibXenon build failed (exit $status). Last 160 log lines:" >&2
+            tail -n 160 "$log" >&2 || true
             exit "$status"
           fi
+          built_elf="$XW_BUILD_BROWSER_DIR/xenon.elf"
+          if [[ ! -s "$built_elf" ]]; then
+            echo "ERROR: Docker finished but did not create $built_elf on the mounted source directory." >&2
+            exit 21
+          fi
+          cp -- "$built_elf" "$RUNNER_TEMP/xenon.elf"
           test -s "$RUNNER_TEMP/xenon.elf"
+          sha256sum "$RUNNER_TEMP/xenon.elf"
 
       - name: Validate ELF32 big-endian PowerPC executable
         shell: bash
