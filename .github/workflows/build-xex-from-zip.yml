@@ -1,495 +1,78 @@
-name: X360Browser — validate and build Xbox 360 XEX automatically
+name: Build X360 Web Total
 
 on:
   workflow_dispatch:
-    inputs:
-      source_archive:
-        description: "Optional source ZIP path in the repository; blank auto-detects the checked-out source tree or ZIP"
-        required: false
-        default: ""
-        type: string
   push:
-    branches: [main, master, principal]
     paths:
-      - "CMakeLists.txt"
-      - "VERSION"
-      - "README.md"
-      - "CHANGELOG.md"
-      - "include/**"
-      - "src/**"
-      - "app/**"
-      - "engine/**"
-      - "platform/xbox360/**"
-      - "tools/**"
-      - "tests/**"
-      - "docs/**"
-      - "examples/**"
-      - "X360Browser-video-config.example.txt"
-      - "platform/xbox360/xsdk/update_manifest.c"
-      - "platform/xbox360/xsdk/update_manifest.h"
-      - "*.zip"
-      - "**/*.zip"
-      - ".github/workflows/build-xex-from-zip.yml"
+      - 'browser/**'
+      - 'usb/**'
+      - 'scripts/**'
+      - '.github/workflows/build-x360-web-total.yml'
+      - 'VERSION'
 
 permissions:
-  contents: write
-
-concurrency:
-  group: x360browser-${{ github.ref }}
-  cancel-in-progress: true
+  contents: read
 
 jobs:
-  validate:
-    name: Validate source, test engines, and package source
-    runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.source.outputs.version }}
-    timeout-minutes: 35
+  host-tests:
+    name: Host parser and protocol tests
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Configure and build
+        run: cmake -S browser -B build-host -DCMAKE_BUILD_TYPE=Release
+      - name: Compile
+        run: cmake --build build-host --parallel 2
+      - name: Run tests
+        run: ctest --test-dir build-host --output-on-failure
 
-      - name: Install host dependencies
-        shell: bash
+  build-xenon:
+    name: Build LibXenon ELF and USB package
+    runs-on: ubuntu-latest
+    needs: host-tests
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Build in the official LibXenon image
         run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config libcurl4-openssl-dev libmbedtls-dev \
-            python3 unzip zip git curl ca-certificates
-
-      - name: Resolve source tree and semantic version
-        id: source
-        shell: bash
-        env:
-          SOURCE_ARCHIVE_INPUT: ${{ inputs.source_archive || '' }}
+          docker pull free60/libxenon:latest
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/browser:/app" \
+            --workdir /app \
+            --entrypoint /bin/sh \
+            free60/libxenon:latest \
+            -lc 'export DEVKITXENON=/usr/local/xenon; export PATH="$DEVKITXENON/bin:$DEVKITXENON/usr/bin:$PATH"; make clean all'
+      - name: Verify ELF output
         run: |
-          set -Eeuo pipefail
-          LOG="$RUNNER_TEMP/x360browser-validation.log"
-          : > "$LOG"
-          log() { printf '%s\n' "$*" | tee -a "$LOG"; }
-
-          locate_root() {
-            local base="$1" version_file candidate version
-            while IFS= read -r version_file; do
-              candidate="${version_file%/VERSION}"
-              [[ -s "$candidate/CMakeLists.txt" && \
-                 -s "$candidate/platform/xbox360/xsdk/main.c" && \
-                 -s "$candidate/tools/build_xbox_shell.sh" && \
-                 -s "$candidate/platform/xbox360/xsdk/page.vert" ]] || continue
-              version="$(tr -d '\r\n' < "$version_file")"
-              [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-              printf '%s\n' "$candidate"
-              return 0
-            done < <(find "$base" -type f -name VERSION \
-              -not -path '*/.git/*' -not -path '*/build/*' \
-              -not -path '*/build-xbox360/*' -print 2>/dev/null | sort)
-            return 1
-          }
-
-          safe_extract_zip() {
-            python3 - "$1" "$2" <<'PY'
-          from pathlib import Path, PurePosixPath
-          import sys, zipfile
-          archive = Path(sys.argv[1])
-          target = Path(sys.argv[2]).resolve()
-          target.mkdir(parents=True, exist_ok=True)
-          with zipfile.ZipFile(archive) as zf:
-              entries = zf.infolist()
-              if len(entries) > 6000:
-                  raise SystemExit("ZIP rejected: too many entries")
-              if sum(e.file_size for e in entries) > 120 * 1024 * 1024:
-                  raise SystemExit("ZIP rejected: uncompressed content exceeds 120 MiB")
-              for e in entries:
-                  p = PurePosixPath(e.filename)
-                  mode = (e.external_attr >> 16) & 0o170000
-                  if "\\" in e.filename or p.is_absolute() or ".." in p.parts or mode == 0o120000:
-                      raise SystemExit(f"ZIP rejected: unsafe path {e.filename!r}")
-              zf.extractall(target)
-          PY
-          }
-
-          PROJECT_DIR=""
-          INPUT="${SOURCE_ARCHIVE_INPUT:-}"
-          ARCHIVE=""
-          if [[ -n "$INPUT" ]]; then
-            case "$INPUT" in
-              /*|..|../*|*/../*|*/..) log "::error::Source ZIP path must stay inside the repository."; exit 2 ;;
-            esac
-            CANDIDATE="$GITHUB_WORKSPACE/$INPUT"
-            [[ -f "$CANDIDATE" ]] || { log "::error::ZIP not found: $INPUT"; exit 2; }
-            REAL="$(realpath -e "$CANDIDATE")"
-            case "$REAL" in "$GITHUB_WORKSPACE"/*) ARCHIVE="$REAL" ;; *) log "::error::ZIP path resolves outside the repository."; exit 2 ;; esac
-          else
-            # Resolve both a checked-out source tree and packaged source archives.
-            # If a committed release ZIP is newer than the checked-out tree, prefer
-            # that ZIP; this keeps phone-only ZIP uploads from accidentally building
-            # an older source tree still present in the repository.
-            PROJECT_DIR="$(locate_root "$GITHUB_WORKSPACE" || true)"
-            NEWEST_ARCHIVE="$(python3 - "$GITHUB_WORKSPACE" <<'PY'
+          test -s browser/xenon.elf
+          python3 - <<'PY'
           from pathlib import Path
-          import re, sys
-          root = Path(sys.argv[1])
-          found = []
-          for p in root.rglob("*.zip"):
-              if ".git" in p.parts or "node_modules" in p.parts:
-                  continue
-              match = re.fullmatch(r"X360Browser-(\d+)\.(\d+)\.(\d+)-source\.zip", p.name, re.I)
-              if match:
-                  found.append(((int(match.group(1)), int(match.group(2)), int(match.group(3))), p))
-          if found:
-              print(max(found, key=lambda item: item[0])[1])
+          p = Path('browser/xenon.elf')
+          b = p.read_bytes()
+          assert b[:4] == b'\x7fELF', 'ELF magic is missing'
+          assert b[4] == 1, 'Expected ELF32'
+          assert b[5] == 2, 'Expected big-endian PowerPC ELF'
+          assert int.from_bytes(b[18:20], 'big') == 20, 'Expected EM_PPC'
+          print(f'ELF validated: {len(b)} bytes, ELF32 big-endian PowerPC')
           PY
-          )"
-            if [[ -n "$NEWEST_ARCHIVE" ]]; then
-              ARCHIVE_VERSION="$(basename "$NEWEST_ARCHIVE" | sed -E 's/^X360Browser-([0-9]+\.[0-9]+\.[0-9]+)-source\.zip$/\1/')"
-              ROOT_VERSION=""
-              if [[ -n "$PROJECT_DIR" && -s "$PROJECT_DIR/VERSION" ]]; then
-                ROOT_VERSION="$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")"
-              fi
-              USE_ARCHIVE=0
-              [[ -z "$PROJECT_DIR" ]] && USE_ARCHIVE=1
-              if [[ "${GITHUB_REF:-}" == "refs/tags/v${ARCHIVE_VERSION}" ]]; then USE_ARCHIVE=1; fi
-              if [[ -n "$ROOT_VERSION" && "$ROOT_VERSION" != "$ARCHIVE_VERSION" && \
-                    "$(printf '%s\n%s\n' "$ROOT_VERSION" "$ARCHIVE_VERSION" | sort -V | tail -n 1)" == "$ARCHIVE_VERSION" ]]; then
-                USE_ARCHIVE=1
-              fi
-              if (( USE_ARCHIVE )); then
-                ARCHIVE="$NEWEST_ARCHIVE"
-                PROJECT_DIR=""
-              fi
-            fi
-          fi
-          if [[ -n "$ARCHIVE" ]]; then
-            unzip -t "$ARCHIVE" >> "$LOG" 2>&1
-            EXTRACT="$RUNNER_TEMP/x360browser-source"
-            rm -rf "$EXTRACT"
-            mkdir -p "$EXTRACT"
-            safe_extract_zip "$ARCHIVE" "$EXTRACT"
-            PROJECT_DIR="$(locate_root "$EXTRACT" || true)"
-          fi
-
-          if [[ -z "$PROJECT_DIR" ]]; then
-            log "::error::Could not find a complete X360Browser source tree or source ZIP with a semantic VERSION."
-            log "Commit the extracted source or add X360Browser-<version>-source.zip to the repository."
-            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -not -path '*/.git/*' -print | sort | head -180 | tee -a "$LOG" || true
-            exit 2
-          fi
-
-          for required in \
-            VERSION CMakeLists.txt README.md CHANGELOG.md \
-            tests/run_host_tests.py tests/validate_project_integrity.py tests/test_xbox_shader_contract.py tests/test_workflow_artifact_paths.py tests/test_default_xex_contract.py \
-            tests/web_engine_fixture_server.py tests/test_web_engine_native.c \
-            tests/test_web_engine_dispatch.c tests/test_youtube_compatibility.c tests/test_auto_update_contract.py \
-            tests/test_update_manifest.c tests/test_runtime_view_contract.py \
-            docs/COMPATIBILITY-5.3.0.md docs/SOURCE-CHANGES-5.3.0.md docs/GRAPHICAL-ENGINE-5.3.0-pt-BR.md \
-            docs/COMPATIBILITY-6.0.0.md docs/SOURCE-CHANGES-6.0.0.md docs/GRAPHICAL-ENGINE-6.0.0-pt-BR.md \
-            docs/COMPATIBILITY-6.1.0.md docs/SOURCE-CHANGES-6.1.0.md docs/AUTO-UPDATE-GITHUB-6.1.0-pt-BR.md docs/COMPATIBILITY-6.2.0.md docs/SOURCE-CHANGES-6.2.0.md docs/ENGINE-AUDIT-6.2.0.md docs/AUTO-UPDATE-GITHUB-6.2.0-pt-BR.md \
-            docs/COMPATIBILITY-7.0.0.md docs/SOURCE-CHANGES-7.0.0.md docs/ENGINE-AUDIT-7.0.0.md \
-            tests/test_auto_release_contract.py tests/test_default_xex_contract.py \
-            tests/test_xenonweb.c tests/test_xenonweb_layout.c tests/test_xenonscript.c tests/test_xenonmedia.c \
-            docs/COMPATIBILITY-5.2.0.md docs/SOURCE-CHANGES-5.2.0.md docs/GRAPHICAL-ENGINE-5.2.0-pt-BR.md platform/xbox360/xsdk/page.vert platform/xbox360/xsdk/page.frag \
-            platform/xbox360/xsdk/visual_renderer.c platform/xbox360/xsdk/visual_renderer.h \
-            platform/xbox360/xsdk/visual_layout.h platform/xbox360/xsdk/main.c \
-            platform/xbox360/xsdk/update_manager.c platform/xbox360/xsdk/update_manager.h \
-            platform/xbox360/xsdk/web_engine.c platform/xbox360/xsdk/CMakeLists.txt \
-            engine/xenonweb/xw_dom.c engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c engine/xenonweb/xw_layout.c \
-            engine/xenonmedia/xm_media.c engine/xenonmedia/xm_playback.c \
-            X360Browser-video-config.example.txt \
-            platform/xbox360/xsdk/update_manifest.c platform/xbox360/xsdk/update_manifest.h \
-            tools/build_xbox_shell.sh; do
-            [[ -s "$PROJECT_DIR/$required" ]] || { log "::error::Missing required source: $required"; exit 2; }
-          done
-          PROJECT_VERSION="$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")"
-          [[ "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { log "::error::VERSION must be MAJOR.MINOR.PATCH; found $PROJECT_VERSION"; exit 2; }
-          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
-            [[ "$TAG_VERSION" == "$PROJECT_VERSION" ]] || { log "::error::Tag $GITHUB_REF_NAME does not match VERSION $PROJECT_VERSION"; exit 2; }
-          fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "PROJECT_VERSION=$PROJECT_VERSION" >> "$GITHUB_ENV"
-          echo "version=$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
-          log "Source root: $PROJECT_DIR"
-          log "Source version: $PROJECT_VERSION"
-
-      - name: Validate package and regression markers
-        shell: bash
+      - name: Download and verify XellLaunch2 2.2.0
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          python3 tests/validate_project_integrity.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 tests/test_xbox_shader_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 tests/test_workflow_artifact_paths.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 tests/test_auto_update_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 tests/test_auto_release_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 tests/test_default_xex_contract.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          python3 -m py_compile tests/run_host_tests.py tests/validate_project_integrity.py tests/web_engine_fixture_server.py tests/test_workflow_artifact_paths.py tests/test_auto_update_contract.py tests/test_auto_release_contract.py tests/test_default_xex_contract.py tests/test_runtime_view_contract.py
-          bash -n tools/build_xbox_shell.sh
-
-      - name: Run XenonWeb, XenonScript, XenonMedia, transport and URL regressions
-        shell: bash
+          curl --fail --location --retry 3 \
+            'https://github.com/mitchellwaite/XellLaunch2/releases/download/v2.2.0/XellLaunch2.xex' \
+            --output XellLaunch2.xex
+          echo '49dd8666b83a7c7b37597affc46513fe2cb9ab5cb2fe1fb71da1b13175276bb0  XellLaunch2.xex' | sha256sum --check
+      - name: Assemble and verify USB root
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          python3 tests/run_host_tests.py 2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-
-      - name: Configure, build and test portable host core
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          cmake -S . -B "$RUNNER_TEMP/x360browser-cmake" \
-            -DX360BROWSER_BUILD_TESTS=ON -DX360BROWSER_BUILD_DEMO=ON -DCMAKE_BUILD_TYPE=Release \
-            2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          cmake --build "$RUNNER_TEMP/x360browser-cmake" --parallel 2 \
-            2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          ctest --test-dir "$RUNNER_TEMP/x360browser-cmake" --output-on-failure \
-            2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-
-      - name: Strict host syntax-check Xbox renderer and engine integration
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          cc -std=c17 -Wall -Wextra -Wshadow -Wconversion -Werror -fsyntax-only \
-            -I tests/mock_xsdk -I platform/xbox360/xsdk -I engine/xenonweb -I engine/xenonmedia \
-            platform/xbox360/xsdk/main.c platform/xbox360/xsdk/update_manager.c platform/xbox360/xsdk/visual_renderer.c \
-            platform/xbox360/xsdk/visual_layout.c engine/xenonweb/xw_dom.c \
-            engine/xenonweb/xw_css.c engine/xenonweb/xw_script.c engine/xenonweb/xw_layout.c \
-            engine/xenonmedia/xm_media.c engine/xenonmedia/xm_playback.c \
-            2>&1 | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-
-      - name: Package validated full source
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          DIST="$RUNNER_TEMP/x360browser-dist"
-          mkdir -p "$DIST"
-          (cd "$PROJECT_DIR" && zip -qr "$DIST/X360Browser-${PROJECT_VERSION}-source.zip" . \
-            -x '.git/*' 'build/*' 'build-xbox360/*' '*.zip' 'tests/__pycache__/*')
-          unzip -t "$DIST/X360Browser-${PROJECT_VERSION}-source.zip" | tee -a "$RUNNER_TEMP/x360browser-validation.log"
-          (cd "$DIST" && sha256sum "X360Browser-${PROJECT_VERSION}-source.zip" > "X360Browser-${PROJECT_VERSION}-source.zip.sha256")
-
-      - name: Upload validated source archive and checksum
-        uses: actions/upload-artifact@v7.0.2
+          python3 scripts/package_usb.py \
+            --elf browser/xenon.elf \
+            --xell XellLaunch2.xex \
+            --project "$GITHUB_WORKSPACE" \
+            --output X360-Web-Total-USB.zip
+      - name: Upload flash-drive package
+        uses: actions/upload-artifact@v4
         with:
-          name: X360Browser-${{ steps.source.outputs.version }}-validated-source
-          # Keep these two files in one directory. Do not add the log path here:
-          # upload-artifact uses their common ancestor as the archive root.
-          path: |
-            ${{ runner.temp }}/x360browser-dist/X360Browser-${{ steps.source.outputs.version }}-source.zip
-            ${{ runner.temp }}/x360browser-dist/X360Browser-${{ steps.source.outputs.version }}-source.zip.sha256
+          name: X360-Web-Total-USB
+          path: X360-Web-Total-USB.zip
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload source validation log
-        if: always()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: X360Browser-${{ steps.source.outputs.version }}-validation-log
-          path: ${{ runner.temp }}/x360browser-validation.log
-          if-no-files-found: warn
-          retention-days: 14
-
-  build-xex:
-    name: Always cross-build and package Xbox 360 XEX
-    needs: validate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - name: Download exact source that passed validation
-        uses: actions/download-artifact@v8.0.2
-        with:
-          name: X360Browser-${{ needs.validate.outputs.version }}-validated-source
-          path: ${{ runner.temp }}/validated
-
-      - name: Install PowerPC/xSDK build dependencies
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build make git curl wget ca-certificates patch \
-            python3 perl bison flex gawk gperf texinfo autoconf automake libtool \
-            pkg-config libgmp-dev libmpfr-dev libmpc-dev libisl-dev zlib1g-dev \
-            libexpat1-dev libssl-dev xz-utils rsync
-
-      - name: Extract validated source (artifact-path-safe)
-        shell: bash
-        env:
-          EXPECTED_SOURCE_VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          set -Eeuo pipefail
-          BUILD_LOG="$RUNNER_TEMP/x360browser-xex-build.log"
-          : > "$BUILD_LOG"
-          log() { printf '%s\n' "$*" | tee -a "$BUILD_LOG"; }
-          DOWNLOAD_DIR="$RUNNER_TEMP/validated"
-
-          # actions/download-artifact normally extracts files at the artifact root.
-          # Search recursively anyway: older upload steps included a sibling log,
-          # which changed the common ancestor and nested the ZIP under x360browser-dist/.
-          mapfile -t ARCHIVES < <(find "$DOWNLOAD_DIR" -type f \
-            -name "X360Browser-${EXPECTED_SOURCE_VERSION}-source.zip" -print 2>/dev/null | sort)
-          if (( ${#ARCHIVES[@]} != 1 )); then
-            log "ERROR: expected exactly one validated source ZIP; found ${#ARCHIVES[@]}"
-            log "Downloaded artifact contents:"
-            find "$DOWNLOAD_DIR" -maxdepth 6 -type f -print 2>/dev/null | sort | tee -a "$BUILD_LOG" || true
-            exit 2
-          fi
-          ARCHIVE="${ARCHIVES[0]}"
-          CHECKSUM="$(find "$(dirname "$ARCHIVE")" -maxdepth 1 -type f \
-            -name "X360Browser-${EXPECTED_SOURCE_VERSION}-source.zip.sha256" -print -quit)"
-          if [[ -z "$CHECKSUM" || ! -s "$CHECKSUM" ]]; then
-            log "ERROR: source ZIP checksum file is missing beside the archive: $ARCHIVE"
-            exit 2
-          fi
-          log "Located validated source ZIP: $ARCHIVE"
-          (cd "$(dirname "$ARCHIVE")" && sha256sum -c "$(basename "$CHECKSUM")") \
-            2>&1 | tee -a "$BUILD_LOG"
-          unzip -t "$ARCHIVE" 2>&1 | tee -a "$BUILD_LOG"
-
-          PROJECT_DIR="$RUNNER_TEMP/x360browser-xex-source"
-          rm -rf "$PROJECT_DIR"
-          mkdir -p "$PROJECT_DIR"
-          # Validate archive paths before extracting; avoid ../ and symlink entries.
-          python3 - "$ARCHIVE" "$PROJECT_DIR" <<'PY'
-          from pathlib import Path, PurePosixPath
-          import sys, zipfile
-          archive = Path(sys.argv[1])
-          target = Path(sys.argv[2]).resolve()
-          with zipfile.ZipFile(archive) as zf:
-              entries = zf.infolist()
-              if len(entries) > 6000:
-                  raise SystemExit("ZIP rejected: too many entries")
-              if sum(e.file_size for e in entries) > 120 * 1024 * 1024:
-                  raise SystemExit("ZIP rejected: uncompressed content exceeds 120 MiB")
-              for entry in entries:
-                  path = PurePosixPath(entry.filename)
-                  mode = (entry.external_attr >> 16) & 0o170000
-                  if "\\" in entry.filename or path.is_absolute() or ".." in path.parts or mode == 0o120000:
-                      raise SystemExit(f"ZIP rejected: unsafe path {entry.filename!r}")
-              zf.extractall(target)
-          PY
-          if [[ ! -s "$PROJECT_DIR/VERSION" ]]; then
-            log "ERROR: VERSION missing after extraction; archive root may be incorrect."
-            find "$PROJECT_DIR" -maxdepth 3 -type f -print | sort | tee -a "$BUILD_LOG" || true
-            exit 2
-          fi
-          FOUND_VERSION="$(tr -d '\r\n' < "$PROJECT_DIR/VERSION")"
-          if [[ "$FOUND_VERSION" != "$EXPECTED_SOURCE_VERSION" ]]; then
-            log "ERROR: expected source version $EXPECTED_SOURCE_VERSION, found $FOUND_VERSION"
-            exit 2
-          fi
-          log "Validated and extracted source version $FOUND_VERSION"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "PROJECT_VERSION=$FOUND_VERSION" >> "$GITHUB_ENV"
-
-      - name: Cache PowerPC toolchain and dependency checkouts
-        uses: actions/cache@v6.1.0
-        with:
-          path: |
-            ~/xsdk-gcc
-            ~/xsdk-gcc-work
-            ~/xsdk
-            ~/glslang-xenon
-            ~/mbedtls-xenon
-            ~/curl-xenon
-          key: x360browser-xsdk-${{ runner.os }}-gcc15-glslang-2026-10-v1
-
-      - name: Build XEX automatically
-        shell: bash
-        env:
-          JOBS: "2"
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          bash tools/build_xbox_shell.sh 2>&1 | tee -a "$RUNNER_TEMP/x360browser-xex-build.log"
-          test -s build-xbox360/X360Browser.xex
-          test -s build-xbox360/default.xex
-          test -s build-xbox360/cacert.pem
-          test -s build-xbox360/X360Browser-video-config.txt
-          test -f build-xbox360/X360Browser-bookmarks.txt
-
-      - name: Package XEX and all first-run runtime files
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          DIST="$RUNNER_TEMP/x360browser-xex-dist"
-          STAGE="$RUNNER_TEMP/x360browser-xex-stage"
-          mkdir -p "$DIST" "$STAGE"
-          for file in default.xex cacert.pem README.txt X360Browser-video-config.txt X360Browser-bookmarks.txt; do
-            test -f "$PROJECT_DIR/build-xbox360/$file"
-            cp "$PROJECT_DIR/build-xbox360/$file" "$STAGE/$file"
-          done
-          for license in "$PROJECT_DIR"/build-xbox360/LICENSE-*.txt; do
-            [[ -s "$license" ]] && cp "$license" "$STAGE/"
-          done
-          (cd "$STAGE" && sha256sum default.xex cacert.pem X360Browser-video-config.txt X360Browser-bookmarks.txt > SHA256SUMS.txt)
-          cp "$STAGE/default.xex" "$DIST/default.xex"
-          (cd "$DIST" && sha256sum default.xex > default.xex.sha256)
-          (cd "$STAGE" && zip -9 -X -q "$DIST/X360Browser-${PROJECT_VERSION}-Xbox360.zip" ./*)
-          (cd "$DIST" && sha256sum "X360Browser-${PROJECT_VERSION}-Xbox360.zip" > "X360Browser-${PROJECT_VERSION}-Xbox360.zip.sha256")
-          cat "$DIST/X360Browser-${PROJECT_VERSION}-Xbox360.zip.sha256"
-
-      - name: Upload Xbox 360 XEX package
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: X360Browser-${{ needs.validate.outputs.version }}-Xbox360-XEX
-          path: |
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-${{ needs.validate.outputs.version }}-Xbox360.zip
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-${{ needs.validate.outputs.version }}-Xbox360.zip.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Guard against reusing a published version
-        id: release_guard
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/principal'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: v${{ needs.validate.outputs.version }}
-          BUILT_XEX: ${{ runner.temp }}/x360browser-xex-dist/default.xex
-        run: |
-          set -Eeuo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            OLD_DIR="$RUNNER_TEMP/previous-release"
-            mkdir -p "$OLD_DIR"
-            if ! gh release download "$RELEASE_TAG" --pattern default.xex --dir "$OLD_DIR"; then
-              echo "::error::Release $RELEASE_TAG already exists but its XEX could not be compared. Bump VERSION to publish a new release."
-              exit 1
-            fi
-            if ! cmp -s "$OLD_DIR/default.xex" "$BUILT_XEX"; then
-              echo "::error::VERSION ${{ needs.validate.outputs.version }} has already been published with different bytes. Increase VERSION (for example, patch +1) before publishing an updated XEX."
-              exit 1
-            fi
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Identical XEX already published as $RELEASE_TAG; no duplicate release needed."
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish GitHub Release after successful XEX build
-        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/principal') && steps.release_guard.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v3.0.3
-        with:
-          tag_name: v${{ needs.validate.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          name: X360Browser v${{ needs.validate.outputs.version }}
-          make_latest: true
-          generate_release_notes: true
-          files: |
-            ${{ runner.temp }}/x360browser-xex-dist/default.xex
-            ${{ runner.temp }}/x360browser-xex-dist/default.xex.sha256
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-${{ needs.validate.outputs.version }}-Xbox360.zip
-            ${{ runner.temp }}/x360browser-xex-dist/X360Browser-${{ needs.validate.outputs.version }}-Xbox360.zip.sha256
-
-      - name: Upload XEX build log even after failure
-        if: always()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: X360Browser-${{ needs.validate.outputs.version }}-XEX-build-log
-          path: ${{ runner.temp }}/x360browser-xex-build.log
-          if-no-files-found: warn
           retention-days: 30
