@@ -258,7 +258,6 @@ jobs:
           cmake -S browser -B "$RUNNER_TEMP/xwt-host-regression" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS='-Wall -Wextra -Wpedantic -Werror'
-
           cmake --build "$RUNNER_TEMP/xwt-host-regression" --parallel 2
           ctest --test-dir "$RUNNER_TEMP/xwt-host-regression" \
             --output-on-failure --no-tests=error
@@ -373,8 +372,11 @@ jobs:
             -e "s|@BUILDROOT_OUTPUT@|$OUTPUT|g" \
             "$OUTPUT/.config"
 
-          # Explicitly select the internal Buildroot toolchain before choosing glibc.
+          # Select Linux 7.2 headers explicitly. Buildroot's default "headers as kernel"
+          # path resolves to the generic 2.6 minimum here, which disables glibc and
+          # iproute2. Both packages need newer headers (glibc >= 3.2, iproute2 >= 3.4).
           python3 - "$OUTPUT/.config" "$HOME" <<'PY'
+          import re
           import sys
           from pathlib import Path
 
@@ -382,7 +384,9 @@ jobs:
           home = sys.argv[2]
           lines = config.read_text().splitlines()
           values = {
+              "BR2_KERNEL_HEADERS_7_2": "y",
               "BR2_TOOLCHAIN_BUILDROOT": "y",
+              "BR2_TOOLCHAIN_BUILDROOT_GLIBC": "y",
               "BR2_PACKAGE_BUSYBOX_SHOW_OTHERS": "y",
               "BR2_CCACHE": "y",
               "BR2_CCACHE_DIR": f'"{home}/.cache/xwt-buildroot-ccache"',
@@ -410,7 +414,7 @@ jobs:
               grep -E "^${symbol}=|^# ${symbol} is not set$" \
                 "$CONFIG_FILE" >&2 || true
               echo "Toolchain resolvida:" >&2
-              grep -E '^(BR2_TOOLCHAIN_BUILDROOT|BR2_TOOLCHAIN_USES_|BR2_TOOLCHAIN_HAS_THREADS|BR2_USE_WCHAR)=' \
+              grep -E '^(BR2_KERNEL_HEADERS_|BR2_TOOLCHAIN_BUILDROOT|BR2_TOOLCHAIN_USES_|BR2_TOOLCHAIN_HAS_THREADS|BR2_USE_WCHAR)=' \
                 "$CONFIG_FILE" >&2 || true
               exit 1
             fi
@@ -419,7 +423,9 @@ jobs:
           # Platform and ABI.
           require_config 'BR2_powerpc64=y'
           require_config 'BR2_powerpc_970=y'
+          require_config 'BR2_KERNEL_HEADERS_7_2=y'
           require_config 'BR2_TOOLCHAIN_BUILDROOT=y'
+          require_config 'BR2_TOOLCHAIN_BUILDROOT_GLIBC=y'
           require_config 'BR2_TOOLCHAIN_USES_GLIBC=y'
           require_config 'BR2_TOOLCHAIN_HAS_THREADS=y'
           require_config 'BR2_USE_WCHAR=y'
