@@ -10,12 +10,6 @@ on:
       - main
       - master
   workflow_dispatch:
-    inputs:
-      source_archive:
-        description: "ZIP de código-fonte 0.11.0; deixe vazio para detectar automaticamente"
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: write
@@ -48,7 +42,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake gcc g++ make python3 python3-pip \
-            curl file zip unzip
+            git ca-certificates curl file zip unzip
           docker --version
           cmake --version
           python3 --version
@@ -56,8 +50,6 @@ jobs:
       - name: Find or safely extract the X360 Web Total source
         id: source
         shell: bash
-        env:
-          SOURCE_ARCHIVE_INPUT: ${{ github.event.inputs.source_archive || '' }}
         run: |
           set -Eeuo pipefail
           python3 - <<'PY'
@@ -149,8 +141,10 @@ jobs:
                   available = "\n".join(str(item) for item in workspace.rglob("*.zip") if ".git" not in item.parts)
                   raise SystemExit(
                       "Não encontrei uma única fonte compatível do X360 Web Total 0.11.0. "
-                      "Extraia o conteúdo de X360-Web-Total-0.11.0-XUTE-Compatibility-Engine-source.zip "
-                      "na raiz do repositório ou coloque esse ZIP na raiz. ZIPs encontrados:\n" + available
+                      "Mantenha X360-Web-Total-0.11.0-XUTE-Compatibility-Engine-source.zip "
+                      "na raiz do repositório. O workflow extrai o ZIP sozinho no runner; "
+                      "não é necessário extrair nem reenviar os arquivos manualmente. "
+                      "Arquivos ZIP encontrados:\n" + available
                   )
 
               archive_path, prefix, infos = candidates[0]
@@ -208,7 +202,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd "$PROJECT_DIR"
-          ./scripts/fetch_moonlight_video_backend.sh
+          # ZIPs podem perder o bit +x. Normalize permissões e invoque com Bash.
+          find scripts -type f -name '*.sh' -exec chmod 755 {} +
+          bash ./scripts/fetch_moonlight_video_backend.sh
           test -s browser/video/moonlight/video.c
           test -s browser/video/moonlight/gpu.c
           test -s browser/video/moonlight/video.h
@@ -258,7 +254,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker pull "$LIBXENON_IMAGE"
+          # Retry transient registry/network errors without requiring another commit.
+          for attempt in 1 2 3; do
+            if docker pull "$LIBXENON_IMAGE"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Não foi possível obter a imagem LibXenon após 3 tentativas." >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
           docker image inspect "$LIBXENON_IMAGE" \
             --format 'LibXenon image: {{index .RepoDigests 0}}' \
             | tee "$RUNNER_TEMP/libxenon-image.txt"
