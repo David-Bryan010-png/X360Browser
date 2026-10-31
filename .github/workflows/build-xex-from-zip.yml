@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       source_archive:
-        description: "ZIP de código-fonte 0.6.0; deixe vazio para detectar automaticamente"
+        description: "ZIP de código-fonte 0.11.0; deixe vazio para detectar automaticamente"
         required: false
         default: ""
         type: string
@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  LIBXENON_IMAGE: free60/libxenon@sha256:3534d7952210ee5553790a1c1f12001145655e28f9e12a01ce151efe4b4f743d
+  LIBXENON_IMAGE: free60/libxenon:latest
   XELL_LAUNCH2_URL: https://github.com/mitchellwaite/XellLaunch2/releases/download/v2.2.0/XellLaunch2.xex
   XELL_LAUNCH2_SHA256: 49dd8666b83a7c7b37597affc46513fe2cb9ab5cb2fe1fb71da1b13175276bb0
 
@@ -74,10 +74,17 @@ jobs:
               "VERSION",
               "REVISION.txt",
               "browser/Makefile",
+              "browser/include/xw_xute.h",
+              "browser/include/xw_xjs.h",
+              "browser/src/xw_xute.c",
+              "browser/src/xw_xjs.c",
               "browser/CMakeLists.txt",
               "scripts/package_usb.py",
               "scripts/test_package_usb.py",
               "scripts/test_nand_boundary.py",
+              "scripts/test_video_backend.py",
+              "scripts/fetch_moonlight_video_backend.sh",
+              "docs/VIDEO-H264-MOONLIGHT.md",
               "README-INSTALL-PT-BR.txt",
               "docs/BOOT-FLOW.md",
               "usb/X360WebTotal/config/browser.ini",
@@ -89,8 +96,8 @@ jobs:
                   return False
               try:
                   return (
-                      (root / "VERSION").read_text(encoding="ascii").strip() == "0.6.0"
-                      and (root / "REVISION.txt").read_text(encoding="ascii").strip() == "revision-expanded-1"
+                      (root / "VERSION").read_text(encoding="ascii").strip() == "0.11.0"
+                      and (root / "REVISION.txt").read_text(encoding="ascii").strip() == "xute-html5-compat-microvm"
                   )
               except (OSError, UnicodeError):
                   return False
@@ -133,7 +140,7 @@ jobs:
                           for prefix in roots:
                               version_member = (prefix + "/" if prefix else "") + "VERSION"
                               revision_member = (prefix + "/" if prefix else "") + "REVISION.txt"
-                              if archive.read(version_member).decode("ascii").strip() == "0.6.0" and archive.read(revision_member).decode("ascii").strip() == "revision-expanded-1":
+                              if archive.read(version_member).decode("ascii").strip() == "0.11.0" and archive.read(revision_member).decode("ascii").strip() == "xute-html5-compat-microvm":
                                   candidates.append((archive_path, prefix, infos))
                   except (OSError, zipfile.BadZipFile, KeyError, UnicodeError):
                       continue
@@ -141,8 +148,8 @@ jobs:
               if len(candidates) != 1:
                   available = "\n".join(str(item) for item in workspace.rglob("*.zip") if ".git" not in item.parts)
                   raise SystemExit(
-                      "Não encontrei uma única fonte compatível do X360 Web Total 0.6.0. "
-                      "Extraia o conteúdo de X360-Web-Total-0.6.0-Revision-Expanded-source.zip "
+                      "Não encontrei uma única fonte compatível do X360 Web Total 0.11.0. "
+                      "Extraia o conteúdo de X360-Web-Total-0.11.0-XUTE-Compatibility-Engine-source.zip "
                       "na raiz do repositório ou coloque esse ZIP na raiz. ZIPs encontrados:\n" + available
                   )
 
@@ -196,6 +203,21 @@ jobs:
           print(f"Tag automática desta compilação: {tag}")
           PY
 
+      - name: Import pinned Moonlight H.264/Xenos video source module
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          ./scripts/fetch_moonlight_video_backend.sh
+          test -s browser/video/moonlight/video.c
+          test -s browser/video/moonlight/gpu.c
+          test -s browser/video/moonlight/video.h
+          test -s browser/video/moonlight/audio.c
+          test -s browser/video/moonlight/audio.h
+          test -s browser/video/moonlight/hwpthread/hwpthread.c
+          test -s browser/video/moonlight/hwpthread/include/pthread.h
+          test -s browser/video/moonlight/LICENSE
+
       - name: Verify source and compile host components
         shell: bash
         run: |
@@ -228,7 +250,9 @@ jobs:
           cd "$PROJECT_DIR"
           python3 scripts/test_package_usb.py
           python3 scripts/test_nand_boundary.py
-          python3 -m py_compile scripts/package_usb.py scripts/test_package_usb.py scripts/test_nand_boundary.py
+          python3 scripts/test_video_backend.py
+          bash -n scripts/fetch_moonlight_video_backend.sh
+          python3 -m py_compile scripts/package_usb.py scripts/test_package_usb.py scripts/test_nand_boundary.py scripts/test_video_backend.py
 
       - name: Download the official LibXenon build image
         shell: bash
@@ -402,6 +426,10 @@ jobs:
               "boot_payload": "ELF32 big-endian PowerPC / LibXenon",
               "launcher": "XellLaunch2.xex 2.2.0",
               "https_tls": "disabled_until_validated",
+              "xute": "html5_semantic_aliases_css_diagnostics",
+              "page_javascript_execution": False,
+              "css_cascade_layout": False,
+              "html5_media_playback": False,
               "automatic_console_update": False,
               "nand_access": False,
               "physical_console_tested": False
@@ -457,8 +485,10 @@ jobs:
           - XellLaunch2 2.2.0 verificado por SHA-256.
           - Pacote USB verificado por CRC e hashes SHA-256 internos.
 
-          ## Limites conhecidos
-          - HTTPS/TLS continua desabilitado nesta versão.
+          ## Novidades e limites
+          - XUTE aplica tradução limitada de elementos HTML5 e gera diagnóstico CSS/JS por página.
+          - XJST executa apenas expressões escalares internas; scripts de sites continuam desativados.
+          - HTTPS/TLS continua desabilitado; CSS cascade, JavaScript de páginas e vídeo HTML5 não são suportados.
           - O aplicativo não acessa NAND, SMC, KV, bootloader ou flash.
           - A compilação automatizada não substitui testes físicos no Xbox 360.
           EOF
