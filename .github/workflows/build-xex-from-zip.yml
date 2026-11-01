@@ -90,11 +90,45 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          test -s XWT-Linux-source.zip || {
-            echo "Envie XWT-Linux-source.zip para a raiz do repositorio." >&2
-            exit 1
-          }
-          python3 - XWT-Linux-source.zip "$RUNNER_TEMP/xwt-project" <<'PY'
+          # Aceita tanto o ZIP-fonte direto quanto o pacote externo enviado
+          # atualmente ao repositorio (XWT-Linux-GitHub-Upload-4.zip).
+          # O pacote externo contem XWT-Linux-source.zip dentro dele.
+          SOURCE_ARCHIVE="$RUNNER_TEMP/XWT-Linux-source.zip"
+          if [ -s "XWT-Linux-source.zip" ]; then
+            cp "XWT-Linux-source.zip" "$SOURCE_ARCHIVE"
+            echo "Fonte direta encontrada na raiz."
+          else
+            python3 - "$GITHUB_WORKSPACE" "$SOURCE_ARCHIVE" <<'PYWRAPPER'
+          import sys, zipfile
+          from pathlib import Path, PurePosixPath
+          root, output = Path(sys.argv[1]), Path(sys.argv[2])
+          candidates = sorted(root.glob('XWT-Linux-GitHub-Upload*.zip'))
+          candidates += sorted(root.glob('XWT-Linux-*-setup*.zip'))
+          candidates = list(dict.fromkeys(p for p in candidates if p.is_file()))
+          if len(candidates) != 1:
+              raise SystemExit('Nao encontrei um unico pacote externo XWT-Linux-GitHub-Upload*.zip ou XWT-Linux-*-setup*.zip na raiz. Encontrados: ' + ', '.join(p.name for p in candidates))
+          wrapper = candidates[0]
+          with zipfile.ZipFile(wrapper) as z:
+              matches = [i for i in z.infolist() if PurePosixPath(i.filename).name == 'XWT-Linux-source.zip' and not i.is_dir()]
+              if len(matches) != 1:
+                  raise SystemExit(f'{wrapper.name}: esperado exatamente um XWT-Linux-source.zip interno; encontrados {len(matches)}')
+              info = matches[0]
+              path = PurePosixPath(info.filename)
+              if path.is_absolute() or '..' in path.parts or '\\' in info.filename:
+                  raise SystemExit('Caminho inseguro para o ZIP-fonte interno')
+              if info.file_size > 128 * 1024 * 1024:
+                  raise SystemExit('ZIP-fonte interno excede 128 MiB')
+              with z.open(info) as src, output.open('wb') as dst:
+                  while True:
+                      chunk = src.read(1024 * 1024)
+                      if not chunk: break
+                      dst.write(chunk)
+          if not output.is_file() or output.stat().st_size == 0:
+              raise SystemExit('Nao foi possivel extrair o ZIP-fonte interno')
+          print(f'Pacote externo reconhecido: {wrapper.name}; fonte extraida: {output.name}')
+          PYWRAPPER
+          fi
+          python3 - "$SOURCE_ARCHIVE" "$RUNNER_TEMP/xwt-project" <<'PY'
           import hashlib, re, shutil, stat, sys, zipfile
           from pathlib import Path, PurePosixPath
           archive, destination = Path(sys.argv[1]), Path(sys.argv[2])
