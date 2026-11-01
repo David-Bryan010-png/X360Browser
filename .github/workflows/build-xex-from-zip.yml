@@ -540,6 +540,55 @@ jobs:
           df -h
 
       # =========================================================
+      # 10.1. FIX KERNEL IMAGE INSTALLATION
+      # =========================================================
+
+      - name: Patch Buildroot kernel target installation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          MAKEFILE="$RUNNER_TEMP/buildroot/linux/linux.mk"
+          test -s "$MAKEFILE"
+
+          python3 - "$MAKEFILE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          old = "\t$(LINUX_INSTALL_KERNEL_IMAGE_TO_TARGET)\n"
+
+          new = (
+              "\t# XWT: keep zImage.xenon in images only; "
+              "do not install it into the PPC64 root filesystem.\n"
+          )
+
+          count = text.count(old)
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one kernel installation call, "
+                  f"found {count}. Build stopped safely."
+              )
+
+          path.write_text(text.replace(old, new, 1))
+
+          print(
+              "OK: kernel image installation into the target "
+              "root filesystem was disabled."
+          )
+          PY
+
+          if grep -Fq \
+            '$(LINUX_INSTALL_KERNEL_IMAGE_TO_TARGET)' \
+            "$MAKEFILE"; then
+            echo "ERROR: kernel installation call still exists."
+            exit 1
+          fi
+
+      # =========================================================
       # 11. CONFIGURE BUILDROOT
       # =========================================================
 
