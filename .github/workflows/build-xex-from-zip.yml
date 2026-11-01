@@ -744,6 +744,12 @@ jobs:
           ORIGINAL="$PROJECT_DIR/linux/post-build.sh"
           WRAPPER="$RUNNER_TEMP/xwt-post-build-wrapper.sh"
 
+          # Confirm both packages survived Buildroot's olddefconfig pass.
+          grep -Fqx 'BR2_PACKAGE_SDL=y' "$CONFIG"
+          grep -Fqx 'BR2_PACKAGE_SDL_TTF=y' "$CONFIG"
+
+          # Resolve the staging path from Buildroot itself, rather than
+          # assuming a fixed PowerPC toolchain/sysroot directory.
           STAGING_DIR="$(
             make -s -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR |
               sed -n 's/^STAGING_DIR[[:space:]]*=[[:space:]]*//p' |
@@ -751,20 +757,91 @@ jobs:
           )"
 
           if [ -z "$STAGING_DIR" ]; then
-            echo "Could not resolve Buildroot STAGING_DIR."
+            echo "ERROR: Could not resolve Buildroot STAGING_DIR."
             make -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR || true
             exit 1
           fi
 
+          case "$STAGING_DIR" in
+            /*) ;;
+            *) STAGING_DIR="$OUTPUT/$STAGING_DIR" ;;
+          esac
+
+          mkdir -p "$STAGING_DIR/usr/include/SDL"
+
+          # Build SDL_ttf and its declared SDL dependency before the full build.
+          JOBS="$(nproc)"
+          if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
+
+          make -C "$BUILDROOT_DIR" O="$OUTPUT" -j"$JOBS" sdl_ttf \
+            2>&1 | tail -n 180
+
+          # In per-package staging mode, a package header may exist in its
+          # package build directory even when the shared sysroot is incomplete.
+          for header in SDL.h SDL_ttf.h; do
+            destination="$STAGING_DIR/usr/include/SDL/$header"
+
+            if [ ! -s "$destination" ]; then
+              source="$(
+                find "$OUTPUT/build" "$OUTPUT/per-package" "$OUTPUT/host" \
+                  -type f -name "$header" -print -quit 2>/dev/null || true
+              )"
+
+              if [ -z "$source" ]; then
+                echo "ERROR: $header is missing from Buildroot staging and package output."
+                find "$OUTPUT" -type f \
+                  \( -name SDL.h -o -name SDL_ttf.h \) \
+                  -print 2>/dev/null || true
+                exit 1
+              fi
+
+              install -m 0644 "$source" "$destination"
+              echo "Restored SDL header: $header from $source"
+            fi
+          done
+
           cat > "$WRAPPER" <<'SH'
           #!/bin/sh
           set -eu
+
           : "${XWT_BUILDROOT_STAGING_DIR:?missing Buildroot staging directory}"
           : "${XWT_BUILDROOT_HOST_DIR:?missing Buildroot host directory}"
+          : "${XWT_BUILDROOT_OUTPUT:?missing Buildroot output directory}"
           : "${XWT_PROJECT_DIR:?missing project directory}"
+
           export STAGING_DIR="$XWT_BUILDROOT_STAGING_DIR"
           export HOST_DIR="$XWT_BUILDROOT_HOST_DIR"
           export TARGET_DIR="${1:-}"
+
+          SDL_INCLUDE="$STAGING_DIR/usr/include/SDL"
+          mkdir -p "$SDL_INCLUDE"
+
+          # Recheck at hook execution time. Buildroot may have changed package
+          # staging between the early preflight and target-finalize.
+          for header in SDL.h SDL_ttf.h; do
+            destination="$SDL_INCLUDE/$header"
+
+            if [ ! -s "$destination" ]; then
+              source="$(
+                find "$XWT_BUILDROOT_OUTPUT/build" \
+                     "$XWT_BUILDROOT_OUTPUT/per-package" \
+                     "$XWT_BUILDROOT_HOST_DIR" \
+                     -type f -name "$header" -print -quit 2>/dev/null || true
+              )"
+
+              if [ -z "$source" ]; then
+                echo "ERROR: $header is absent from staging and package output." >&2
+                find "$XWT_BUILDROOT_OUTPUT" \
+                  -type f \( -name SDL.h -o -name SDL_ttf.h \) \
+                  -print 2>/dev/null || true
+                exit 1
+              fi
+
+              install -m 0644 "$source" "$destination"
+              echo "Restored SDL header at post-build time: $header from $source"
+            fi
+          done
+
           exec "$XWT_PROJECT_DIR/linux/post-build.sh" "$@"
           SH
 
@@ -794,32 +871,13 @@ jobs:
           {
             echo "XWT_BUILDROOT_STAGING_DIR=$STAGING_DIR"
             echo "XWT_BUILDROOT_HOST_DIR=$OUTPUT/host"
+            echo "XWT_BUILDROOT_OUTPUT=$OUTPUT"
             echo "XWT_PROJECT_DIR=$PROJECT_DIR"
           } >> "$GITHUB_ENV"
 
           echo "Buildroot staging: $STAGING_DIR"
           echo "Post-build wrapper: $WRAPPER"
-
-          JOBS="$(nproc)"
-          if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
-
-          make -C "$BUILDROOT_DIR" O="$OUTPUT" -j"$JOBS" sdl_ttf \
-            2>&1 | tail -n 180
-
-          for header in \
-            "$STAGING_DIR/usr/include/SDL/SDL.h" \
-            "$STAGING_DIR/usr/include/SDL/SDL_ttf.h"
-          do
-            if [ ! -s "$header" ]; then
-              echo "Required SDL staging header not found: $header"
-              find "$OUTPUT/host" "$OUTPUT/per-package" \
-                -type f \( -name SDL.h -o -name SDL_ttf.h \) \
-                -print 2>/dev/null || true
-              exit 1
-            fi
-          done
-
-          echo "SDL and SDL_ttf staging headers verified."
+          echo "SDL and SDL_ttf headers are present before target-finalize."
 
       # =========================================================
       # 12. COMPILE
@@ -852,6 +910,7 @@ jobs:
             echo "BUILDROOT COMPILATION FAILED"
             df -h
             exit 1
+          fi
           fi
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
