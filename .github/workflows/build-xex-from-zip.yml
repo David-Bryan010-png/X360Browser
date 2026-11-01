@@ -1,4 +1,3 @@
-
 name: X360 Web Total - Xenon Linux Build
 
 on:
@@ -22,6 +21,7 @@ env:
   XWT_REVISION: linux-xenon-desktop-shell
   CCACHE_DIR: /home/runner/.cache/xwt-buildroot-ccache
   CCACHE_MAXSIZE: 512M
+  BR2_DL_DIR: /home/runner/.cache/xwt-buildroot-dl
 
 jobs:
   build-linux:
@@ -31,7 +31,7 @@ jobs:
 
     steps:
       # =========================================================
-      # 1. FREE DISK SPACE BEFORE ANY HEAVY OPERATION
+      # 1. FREE DISK SPACE
       # =========================================================
 
       - name: Free runner disk space
@@ -42,8 +42,6 @@ jobs:
           echo "=== INITIAL DISK ==="
           df -h
           df -i
-
-          echo "Removing unnecessary preinstalled SDKs..."
 
           sudo rm -rf \
             /usr/share/dotnet \
@@ -113,17 +111,19 @@ jobs:
           ccache --version
 
       # =========================================================
-      # 4. INCREMENTAL CACHE
+      # 4. RESTORE INCREMENTAL CACHES
       # =========================================================
 
-      - name: Restore compiler cache
+      - name: Restore Buildroot downloads and compiler cache
         uses: actions/cache@v4
         with:
-          path: ~/.cache/xwt-buildroot-ccache
-          key: ${{ runner.os }}-xwt-ccache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-${{ github.run_id }}
+          path: |
+            ~/.cache/xwt-buildroot-ccache
+            ~/.cache/xwt-buildroot-dl
+          key: ${{ runner.os }}-xwt-cache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-xwt-ccache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-
-            ${{ runner.os }}-xwt-ccache-${{ env.XWT_VERSION }}-
+            ${{ runner.os }}-xwt-cache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-
+            ${{ runner.os }}-xwt-cache-${{ env.XWT_VERSION }}-
 
       - name: Configure compiler cache
         shell: bash
@@ -131,13 +131,17 @@ jobs:
           set -Eeuo pipefail
 
           mkdir -p "$CCACHE_DIR"
+          mkdir -p "$BR2_DL_DIR"
 
           ccache --set-config=max_size=512M
           ccache --set-config=compression=true
           ccache --zero-stats || true
 
           echo "Compiler cache configured."
+          echo "Buildroot download cache configured."
+
           ccache --show-stats
+          du -sh "$BR2_DL_DIR" || true
 
       # =========================================================
       # 5. SOURCE VALIDATION
@@ -544,8 +548,6 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          export BR2_DL_DIR="$HOME/.cache/xwt-buildroot-dl"
-
           mkdir -p "$BR2_DL_DIR"
           mkdir -p "$CCACHE_DIR"
 
@@ -587,6 +589,18 @@ jobs:
               ]
 
               lines.append(f"{symbol}={value}")
+
+          # O zImage.xenon possui um wrapper de boot PowerPC.
+          # Ele deve permanecer em images/, fora do rootfs PPC64.
+          symbol = "BR2_LINUX_KERNEL_INSTALL_TARGET"
+
+          lines = [
+              line for line in lines
+              if not line.startswith(symbol + "=")
+              and line != f"# {symbol} is not set"
+          ]
+
+          lines.append("# BR2_LINUX_KERNEL_INSTALL_TARGET is not set")
 
           config.write_text("\n".join(lines) + "\n")
           PY
@@ -647,6 +661,13 @@ jobs:
           require_config 'BR2_TARGET_ROOTFS_CPIO=y'
           require_config 'BR2_TARGET_ROOTFS_CPIO_GZIP=y'
 
+          require_config '# BR2_LINUX_KERNEL_INSTALL_TARGET is not set'
+
+          if grep -q '^BR2_LINUX_KERNEL_INSTALL_TARGET=y$' "$CONFIG"; then
+            echo "ERROR: Kernel must not be installed into the PPC64 rootfs /boot."
+            exit 1
+          fi
+
           grep -Fq "$PROJECT_DIR/linux/post-build.sh" "$CONFIG"
 
           echo "=== DISK BEFORE BUILD ==="
@@ -668,7 +689,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          export BR2_DL_DIR="$HOME/.cache/xwt-buildroot-dl"
+          mkdir -p "$BR2_DL_DIR"
 
           ccache --max-size=512M || true
 
@@ -676,6 +697,7 @@ jobs:
 
           echo "Buildroot workers: $JOBS"
           echo "Compiler cache: 512 MB"
+          echo "Download cache: $BR2_DL_DIR"
 
           echo "=== DISK BEFORE COMPILATION ==="
           df -h
@@ -914,7 +936,7 @@ jobs:
             "$USB" "$SOURCE" > SHA256SUMS.txt
 
       # =========================================================
-      # 16. REMOVE HEAVY BUILD FILES
+      # 16. REMOVE TEMPORARY BUILD FILES
       # =========================================================
 
       - name: Remove temporary build data
@@ -922,16 +944,18 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          echo "Removing Buildroot temporary files..."
+          echo "Removing temporary Buildroot source and output..."
 
           rm -rf \
             "$RUNNER_TEMP/buildroot-output" \
             "$RUNNER_TEMP/buildroot" \
             "$RUNNER_TEMP/free60-xenon" \
-            "$RUNNER_TEMP/xwt-host-regression" \
-            "$HOME/.cache/xwt-buildroot-dl"
+            "$RUNNER_TEMP/xwt-host-regression"
 
-          echo "Compiler cache will be preserved for saving."
+          # Não apagar BR2_DL_DIR nem CCACHE_DIR.
+          # Ambos serão salvos pelo actions/cache.
+          echo "Download cache preserved: $BR2_DL_DIR"
+          echo "Compiler cache preserved: $CCACHE_DIR"
 
           echo "=== DISK BEFORE ARTIFACT UPLOAD ==="
           df -h
