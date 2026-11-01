@@ -1,3 +1,4 @@
+
 name: XWT Linux - Build minimal Xenon core
 
 on:
@@ -270,7 +271,7 @@ jobs:
               ]
               raise SystemExit("Fonte incompleta: " + ", ".join(missing))
 
-          # CORRECAO: o ZIP pode perder o bit de execucao deste script.
+          # O ZIP pode perder o bit de execucao deste script.
           # Forca 0755 antes de qualquer chamada do Buildroot.
           post_build = destination / "linux/post-build.sh"
           post_build.chmod(0o755)
@@ -331,6 +332,81 @@ jobs:
           print(
               f"Fonte minimal-core validada: {len(expected)} arquivos com SHA-256"
           )
+          PY
+
+          # Corrige a validacao ELF sem enfraquecer a verificacao dos segmentos.
+          # O entry point zero so sera aceito se estiver dentro de um PT_LOAD executavel.
+          python3 \
+            "$RUNNER_TEMP/xwt-project/scripts/package_linux_usb.py" \
+            "$RUNNER_TEMP/xwt-project/scripts/test_package_linux_usb.py" <<'PY'
+          import sys
+          from pathlib import Path
+
+          package_path = Path(sys.argv[1])
+          tests_path = Path(sys.argv[2])
+
+          package_text = package_path.read_text(encoding="utf-8")
+
+          old_check = (
+              '    if entry == 0:\n'
+              '        raise ValueError("kernel ELF has a zero entry point")\n'
+          )
+
+          replacement = (
+              "    # ELF entry zero is valid only when an executable PT_LOAD\n"
+              "    # segment maps address zero. The range check below remains mandatory.\n"
+          )
+
+          if package_text.count(old_check) == 1:
+              package_text = package_text.replace(
+                  old_check,
+                  replacement,
+                  1
+              )
+              package_path.write_text(package_text, encoding="utf-8")
+
+          elif "ELF entry zero is valid only when an executable PT_LOAD" not in package_text:
+              raise SystemExit(
+                  "Unexpected package_linux_usb.py validator; refusing an unsafe patch"
+              )
+
+          tests_text = tests_path.read_text(encoding="utf-8")
+
+          anchor = (
+              "    def test_kernel_header_and_program_header(self):\n"
+              "        pkg.validate_kernel_bytes(valid_ppc32_elf())\n\n"
+          )
+
+          extra_tests = anchor + (
+              "    def test_accepts_zero_entry_point_at_executable_load_address_zero(self):\n"
+              "        data = bytearray(valid_ppc32_elf())\n"
+              "        struct.pack_into(\">I\", data, 24, 0)\n"
+              "        struct.pack_into(\">I\", data, 52 + 12, 0)  # p_paddr = 0\n"
+              "        pkg.validate_kernel_bytes(data)\n\n"
+              "    def test_rejects_zero_entry_point_outside_executable_load_segment(self):\n"
+              "        data = bytearray(valid_ppc32_elf())\n"
+              "        struct.pack_into(\">I\", data, 24, 0)\n"
+              "        with self.assertRaisesRegex(\n"
+              "            ValueError,\n"
+              "            \"entry point is not inside an executable PT_LOAD segment\",\n"
+              "        ):\n"
+              "            pkg.validate_kernel_bytes(data)\n\n"
+          )
+
+          if tests_text.count(anchor) == 1:
+              tests_text = tests_text.replace(anchor, extra_tests, 1)
+              tests_path.write_text(tests_text, encoding="utf-8")
+
+          elif "test_accepts_zero_entry_point_at_executable_load_address_zero" not in tests_text:
+              raise SystemExit(
+                  "Unexpected test_package_linux_usb.py layout; refusing an untested patch"
+              )
+
+          print(
+              "ELF validator patched. Entry zero is accepted only inside "
+              "an executable PT_LOAD segment."
+          )
+          print("Positive and negative regression tests installed.")
           PY
 
           echo "PROJECT_DIR=$RUNNER_TEMP/xwt-project" >> "$GITHUB_ENV"
@@ -708,9 +784,7 @@ jobs:
 
           echo "Kconfig preflight passed; full kernel/rootfs compilation may begin."
 
-      # CORRECAO PRINCIPAL:
-      # garante que o post-build.sh seja executavel imediatamente antes do make.
-
+      # Garante que o post-build.sh seja executavel imediatamente antes do make.
       - name: Ensure Buildroot post-build script is executable
         shell: bash
         run: |
@@ -919,28 +993,70 @@ jobs:
           set -Eeuo pipefail
 
           KERNEL="$RUNNER_TEMP/buildroot-output/images/zImage.xenon"
+          DIAG="$RUNNER_TEMP/kernel-diagnostics"
+
+          mkdir -p "$DIAG"
 
           test -s "$KERNEL" || {
             echo 'Buildroot did not create images/zImage.xenon' >&2
             exit 1
           }
 
-          file "$KERNEL"
+          cp "$KERNEL" "$DIAG/zImage.xenon"
 
-          PYTHONPATH="$PROJECT_DIR/scripts" python3 - "$KERNEL" <<'PY'
+          stat "$KERNEL" > "$DIAG/kernel-stat.txt"
+          file "$KERNEL" | tee "$DIAG/kernel-file.txt"
+          od -An -tx1 -N96 "$KERNEL" \
+            > "$DIAG/kernel-first-96-bytes.txt"
+
+          readelf -hW "$KERNEL" \
+            > "$DIAG/kernel-elf-header.txt" 2>&1 || true
+
+          readelf -lW "$KERNEL" \
+            > "$DIAG/kernel-program-headers.txt" 2>&1 || true
+
+          readelf -SW "$KERNEL" \
+            > "$DIAG/kernel-sections.txt" 2>&1 || true
+
+          objdump -p "$KERNEL" \
+            > "$DIAG/kernel-objdump.txt" 2>&1 || true
+
+          set +e
+
+          PYTHONPATH="$PROJECT_DIR/scripts" python3 - "$KERNEL" 2>&1 <<'PY' | tee "$DIAG/kernel-validation.log"
           import sys
           from pathlib import Path
           import package_linux_usb
 
           path = Path(sys.argv[1])
 
+          print("Validating the XeLL ELF32/PowerPC kernel...")
+          print("File:", path)
+          print("Size:", path.stat().st_size, "bytes")
+
           package_linux_usb.validate_kernel(path)
 
           print(
-              f"XeLL ELF32/PPC wrapper validated: "
-              f"{path} ({path.stat().st_size} bytes)"
+              "XeLL ELF validation passed:",
+              path,
+              f"({path.stat().st_size} bytes)"
           )
           PY
+
+          VALIDATION_STATUS=${PIPESTATUS[0]}
+
+          set -e
+
+          echo "$VALIDATION_STATUS" \
+            > "$DIAG/kernel-validation-exit-code.txt"
+
+          if [ "$VALIDATION_STATUS" -ne 0 ]; then
+            echo "XeLL kernel validation failed; ELF diagnostics will be uploaded." >&2
+            exit "$VALIDATION_STATUS"
+          fi
+
+          echo "Kernel ELF32/PowerPC validation passed."
+          echo "Entry zero is accepted only inside an executable PT_LOAD segment."
 
       - name: Save cross-toolchain cache for future native modules
         if: success()
@@ -1231,6 +1347,7 @@ jobs:
             ${{ runner.temp }}/buildroot-build.log
             ${{ runner.temp }}/free60-commit.txt
             ${{ runner.temp }}/buildroot-commit.txt
+            ${{ runner.temp }}/kernel-diagnostics/**
           if-no-files-found: ignore
           retention-days: 14
 
@@ -1278,7 +1395,6 @@ jobs:
           TAG="xwt-v${XWT_VERSION}-core-${GITHUB_SHA:0:12}"
           NOTES="$RUNNER_TEMP/release-notes.md"
 
-          # As crases precisam ser escapadas: este heredoc expande variáveis.
           cat > "$NOTES" <<EOF_NOTES
           # XWT Linux ${XWT_VERSION} — Minimal Core
 
