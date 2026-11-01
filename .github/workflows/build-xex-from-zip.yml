@@ -1,3 +1,4 @@
+
 name: X360 Web Total - Xenon Linux Build
 
 on:
@@ -20,7 +21,7 @@ env:
   XWT_VERSION: "0.13.0"
   XWT_REVISION: linux-xenon-desktop-shell
   CCACHE_DIR: /home/runner/.cache/xwt-buildroot-ccache
-  CCACHE_MAXSIZE: 512M
+  CCACHE_MAXSIZE: 1G
   BR2_DL_DIR: /home/runner/.cache/xwt-buildroot-dl
 
 jobs:
@@ -115,15 +116,15 @@ jobs:
       # =========================================================
 
       - name: Restore Buildroot downloads and compiler cache
-        uses: actions/cache@v4
+        id: buildroot-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cache/xwt-buildroot-ccache
             ~/.cache/xwt-buildroot-dl
-          key: ${{ runner.os }}-xwt-cache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v2
           restore-keys: |
-            ${{ runner.os }}-xwt-cache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-
-            ${{ runner.os }}-xwt-cache-${{ env.XWT_VERSION }}-
+            ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-
 
       - name: Configure compiler cache
         shell: bash
@@ -133,7 +134,7 @@ jobs:
           mkdir -p "$CCACHE_DIR"
           mkdir -p "$BR2_DL_DIR"
 
-          ccache --set-config=max_size=512M
+          ccache --set-config=max_size=1G
           ccache --set-config=compression=true
           ccache --zero-stats || true
 
@@ -409,7 +410,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Werror"
 
-          cmake --build "$RUNNER_TEMP/xwt-host-regression" --parallel 2
+          cmake --build "$RUNNER_TEMP/xwt-host-regression" --parallel 4
 
           ctest \
             --test-dir "$RUNNER_TEMP/xwt-host-regression" \
@@ -639,8 +640,7 @@ jobs:
 
               lines.append(f"{symbol}={value}")
 
-          # O zImage.xenon possui um wrapper de boot PowerPC.
-          # Ele deve permanecer em images/, fora do rootfs PPC64.
+          # Keep the Xenon kernel image outside the PPC64 root filesystem.
           symbol = "BR2_LINUX_KERNEL_INSTALL_TARGET"
 
           lines = [
@@ -730,6 +730,98 @@ jobs:
           fi
 
       # =========================================================
+      # 11.1. PREPARE SDL STAGING AND POST-BUILD ENVIRONMENT
+      # =========================================================
+
+      - name: Prepare SDL staging and post-build wrapper
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          BUILDROOT_DIR="$RUNNER_TEMP/buildroot"
+          OUTPUT="$RUNNER_TEMP/buildroot-output"
+          CONFIG="$OUTPUT/.config"
+          ORIGINAL="$PROJECT_DIR/linux/post-build.sh"
+          WRAPPER="$RUNNER_TEMP/xwt-post-build-wrapper.sh"
+
+          STAGING_DIR="$(
+            make -s -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR |
+              sed -n 's/^STAGING_DIR[[:space:]]*=[[:space:]]*//p' |
+              tail -n 1
+          )"
+
+          if [ -z "$STAGING_DIR" ]; then
+            echo "Could not resolve Buildroot STAGING_DIR."
+            make -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR || true
+            exit 1
+          fi
+
+          cat > "$WRAPPER" <<'SH'
+          #!/bin/sh
+          set -eu
+          : "${XWT_BUILDROOT_STAGING_DIR:?missing Buildroot staging directory}"
+          : "${XWT_BUILDROOT_HOST_DIR:?missing Buildroot host directory}"
+          : "${XWT_PROJECT_DIR:?missing project directory}"
+          export STAGING_DIR="$XWT_BUILDROOT_STAGING_DIR"
+          export HOST_DIR="$XWT_BUILDROOT_HOST_DIR"
+          export TARGET_DIR="${1:-}"
+          exec "$XWT_PROJECT_DIR/linux/post-build.sh" "$@"
+          SH
+
+          chmod 0755 "$WRAPPER"
+
+          python3 - "$CONFIG" "$ORIGINAL" "$WRAPPER" <<'PY'
+          import sys
+          from pathlib import Path
+
+          config, original, wrapper = map(Path, sys.argv[1:])
+          text = config.read_text()
+          old = str(original)
+          new = str(wrapper)
+
+          if text.count(old) != 1:
+              raise SystemExit(
+                  "Expected exactly one project post-build script path "
+                  "in Buildroot .config."
+              )
+
+          config.write_text(text.replace(old, new, 1))
+          PY
+
+          make -C "$BUILDROOT_DIR" O="$OUTPUT" olddefconfig 2>&1 | tail -n 100
+          grep -Fq "$WRAPPER" "$CONFIG"
+
+          {
+            echo "XWT_BUILDROOT_STAGING_DIR=$STAGING_DIR"
+            echo "XWT_BUILDROOT_HOST_DIR=$OUTPUT/host"
+            echo "XWT_PROJECT_DIR=$PROJECT_DIR"
+          } >> "$GITHUB_ENV"
+
+          echo "Buildroot staging: $STAGING_DIR"
+          echo "Post-build wrapper: $WRAPPER"
+
+          JOBS="$(nproc)"
+          if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
+
+          make -C "$BUILDROOT_DIR" O="$OUTPUT" -j"$JOBS" sdl_ttf \
+            2>&1 | tail -n 180
+
+          for header in \
+            "$STAGING_DIR/usr/include/SDL/SDL.h" \
+            "$STAGING_DIR/usr/include/SDL/SDL_ttf.h"
+          do
+            if [ ! -s "$header" ]; then
+              echo "Required SDL staging header not found: $header"
+              find "$OUTPUT/host" "$OUTPUT/per-package" \
+                -type f \( -name SDL.h -o -name SDL_ttf.h \) \
+                -print 2>/dev/null || true
+              exit 1
+            fi
+          done
+
+          echo "SDL and SDL_ttf staging headers verified."
+
+      # =========================================================
       # 12. COMPILE
       # =========================================================
 
@@ -740,12 +832,13 @@ jobs:
 
           mkdir -p "$BR2_DL_DIR"
 
-          ccache --max-size=512M || true
+          ccache --max-size=1G || true
 
-          JOBS=2
+          JOBS="$(nproc)"
+          if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
 
           echo "Buildroot workers: $JOBS"
-          echo "Compiler cache: 512 MB"
+          echo "Compiler cache: 1 GB"
           echo "Download cache: $BR2_DL_DIR"
 
           echo "=== DISK BEFORE COMPILATION ==="
@@ -812,6 +905,19 @@ jobs:
 
           echo "=== DISK AFTER COMPILATION ==="
           df -h
+
+      # =========================================================
+      # 12.1. SAVE CACHE EVEN IF COMPILATION FAILS
+      # =========================================================
+
+      - name: Save Buildroot caches (including after failed builds)
+        if: ${{ always() && steps.buildroot-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/xwt-buildroot-ccache
+            ~/.cache/xwt-buildroot-dl
+          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v2
 
       # =========================================================
       # 13. CREATE USB PACKAGE
@@ -1001,8 +1107,7 @@ jobs:
             "$RUNNER_TEMP/free60-xenon" \
             "$RUNNER_TEMP/xwt-host-regression"
 
-          # Não apagar BR2_DL_DIR nem CCACHE_DIR.
-          # Ambos serão salvos pelo actions/cache.
+          # Keep Buildroot download and compiler caches.
           echo "Download cache preserved: $BR2_DL_DIR"
           echo "Compiler cache preserved: $CCACHE_DIR"
 
