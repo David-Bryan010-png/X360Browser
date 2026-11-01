@@ -1,4 +1,3 @@
-
 name: X360 Web Total - Xenon Linux Build
 
 on:
@@ -8,6 +7,7 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# The build job is read-only. Only the separate release job receives write access.
 permissions:
   contents: read
 
@@ -18,7 +18,7 @@ concurrency:
 env:
   BUILDROOT_COMMIT: 15b0457158bbe24264ab241cbe87c52b4d659f4e
   FREE60_COMMIT: 3c3e76fb1ffa3bcce3a50a6af6b847a2da25139f
-  XWT_VERSION: "0.13.0"
+  XWT_VERSION: 0.13.0
   XWT_REVISION: linux-xenon-desktop-shell
   CCACHE_DIR: /home/runner/.cache/xwt-buildroot-ccache
   CCACHE_MAXSIZE: 1G
@@ -26,24 +26,23 @@ env:
 
 jobs:
   build-linux:
-    name: Build Xbox 360 Linux
+    name: Validate + build Xenon kernel + rootfs + USB package
     runs-on: ubuntu-24.04
     timeout-minutes: 300
 
     steps:
-      # =========================================================
-      # 1. FREE DISK SPACE
-      # =========================================================
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Free runner disk space
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          echo "=== INITIAL DISK ==="
+          echo "=== DISK BEFORE CLEANUP ==="
           df -h
           df -i
-
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -54,47 +53,25 @@ jobs:
             /usr/local/.ghcup \
             /usr/share/miniconda \
             /usr/local/lib/node_modules
-
           if command -v docker >/dev/null 2>&1; then
             docker system prune -af --volumes || true
           fi
-
           sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          sudo rm -rf /var/cache/apt/archives/*
-
-          echo "=== AVAILABLE DISK ==="
-          df -h
-
-          AVAILABLE=$(df -Pk /home/runner | awk 'NR==2 {print $4}')
-
-          if [ "$AVAILABLE" -lt 5242880 ]; then
-            echo "ERROR: Less than 5 GB available after cleanup."
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+          AVAILABLE="$(df -Pk /home/runner | awk 'NR==2 {print $4}')"
+          if [ "$AVAILABLE" -lt 8388608 ]; then
+            echo "ERROR: menos de 8 GiB disponíveis após a limpeza." >&2
+            df -h
             exit 1
           fi
+          echo "=== DISK AFTER CLEANUP ==="
+          df -h
 
-      # =========================================================
-      # 2. CHECKOUT
-      # =========================================================
-
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-          clean: true
-          fetch-depth: 1
-
-      # =========================================================
-      # 3. INSTALL DEPENDENCIES
-      # =========================================================
-
-      - name: Install dependencies
+      - name: Install host dependencies
         shell: bash
         run: |
           set -Eeuo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y --no-install-recommends \
             build-essential gcc g++ make bc bison flex gawk \
             ccache cpio file git curl wget patch rsync unzip zip \
@@ -102,27 +79,21 @@ jobs:
             cmake pkg-config perl gettext ca-certificates \
             libncurses-dev libssl-dev libelf-dev libffi-dev \
             zlib1g-dev zstd xz-utils
-
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-
-          echo "=== DISK AFTER DEPENDENCIES ==="
-          df -h
-
+          git --version
+          gcc --version
+          make --version
+          python3 --version
+          cmake --version
           ccache --version
 
-      # =========================================================
-      # 4. RESTORE INCREMENTAL CACHES
-      # =========================================================
-
-      - name: Restore Buildroot downloads and compiler cache
+      - name: Restore Buildroot download and compiler caches
         id: buildroot-cache
         uses: actions/cache/restore@v4
         with:
           path: |
-            ~/.cache/xwt-buildroot-ccache
             ~/.cache/xwt-buildroot-dl
-          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v2
+            ~/.cache/xwt-buildroot-ccache
+          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v3
           restore-keys: |
             ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-
 
@@ -130,40 +101,28 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          mkdir -p "$CCACHE_DIR"
-          mkdir -p "$BR2_DL_DIR"
-
-          ccache --set-config=max_size=1G
+          mkdir -p "$CCACHE_DIR" "$BR2_DL_DIR"
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
           ccache --set-config=compression=true
           ccache --zero-stats || true
-
-          echo "Compiler cache configured."
-          echo "Buildroot download cache configured."
-
           ccache --show-stats
           du -sh "$BR2_DL_DIR" || true
 
-      # =========================================================
-      # 5. SOURCE VALIDATION
-      # =========================================================
-
-      - name: Locate and validate project source
+      - name: Locate or safely extract and verify the 0.13.0 source
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          python3 <<'PY'
+          python3 - <<'PY'
           import os
           import shutil
           import stat
+          import subprocess
           import zipfile
           from pathlib import Path, PurePosixPath
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           extraction = Path(os.environ["RUNNER_TEMP"]) / "xwt-project"
-
-          required = [
+          required = (
               "VERSION",
               "REVISION.txt",
               "linux/buildroot.config",
@@ -190,13 +149,13 @@ jobs:
               "scripts/test_desktop.py",
               "scripts/test_nand_boundary.py",
               "README-INSTALL-PT-BR.txt",
-          ]
+          )
 
-          def valid(root):
+          def valid(root: Path) -> bool:
               try:
                   return (
                       root.is_dir()
-                      and all((root / item).is_file() for item in required)
+                      and all((root / name).is_file() for name in required)
                       and (root / "VERSION").read_text().strip() == "0.13.0"
                       and (root / "REVISION.txt").read_text().strip()
                       == "linux-xenon-desktop-shell"
@@ -204,158 +163,121 @@ jobs:
               except (OSError, UnicodeError):
                   return False
 
-          candidates = [workspace]
-
-          candidates.extend(
-              p for p in workspace.iterdir()
-              if p.is_dir() and p.name not in {".git", ".github"}
-          )
-
-          found = [p for p in candidates if valid(p)]
+          directories = [workspace] + [
+              path for path in workspace.iterdir()
+              if path.is_dir() and path.name not in {".git", ".github"}
+          ]
+          found = [path for path in directories if valid(path)]
 
           if len(found) == 1:
               project = found[0]
-
           elif len(found) > 1:
-              raise SystemExit("Multiple valid project source directories found.")
-
+              raise SystemExit("Mais de uma árvore de fonte 0.13.0 foi encontrada.")
           else:
-              archives = []
-
+              candidates = []
               for archive in workspace.glob("*.zip"):
                   try:
                       with zipfile.ZipFile(archive) as zf:
                           infos = zf.infolist()
-                          names = {i.filename for i in infos}
-
-                          if len(names) != len(infos):
-                              raise SystemExit("Duplicate ZIP paths detected.")
-
+                          names = [info.filename for info in infos]
+                          if len(names) != len(set(names)):
+                              raise SystemExit(f"ZIP contém caminhos duplicados: {archive.name}")
+                          name_set = set(names)
                           for name in names:
                               item = PurePosixPath(name)
-
-                              if item.name != "VERSION":
-                                  continue
-
                               if (
-                                  item.is_absolute()
+                                  item.name != "VERSION"
+                                  or item.is_absolute()
                                   or ".." in item.parts
                                   or "\\" in name
                                   or "\x00" in name
+                                  or (item.parts and item.parts[0].endswith(":"))
                               ):
                                   continue
-
-                              prefix = (
-                                  "" if str(item.parent) == "."
-                                  else str(item.parent) + "/"
-                              )
-
-                              if not all(prefix + x in names for x in required):
+                              prefix = "" if str(item.parent) == "." else str(item.parent) + "/"
+                              if not all(prefix + entry in name_set for entry in required):
                                   continue
-
-                              if (
-                                  zf.read(prefix + "VERSION").decode().strip()
-                                  == "0.13.0"
-                                  and zf.read(prefix + "REVISION.txt").decode().strip()
-                                  == "linux-xenon-desktop-shell"
-                              ):
-                                  archives.append((archive, prefix, infos))
-
-                  except (
-                      OSError,
-                      zipfile.BadZipFile,
-                      KeyError,
-                      UnicodeError
-                  ):
+                              version = zf.read(prefix + "VERSION").decode().strip()
+                              revision = zf.read(prefix + "REVISION.txt").decode().strip()
+                              if version == "0.13.0" and revision == "linux-xenon-desktop-shell":
+                                  candidates.append((archive, prefix, infos))
+                  except (OSError, zipfile.BadZipFile, KeyError, UnicodeError):
                       continue
 
-              if len(archives) != 1:
+              if len(candidates) != 1:
                   raise SystemExit(
-                      "Expected exactly one valid X360 Web Total 0.13.0 source."
+                      "Não encontrei uma única fonte válida 0.13.0. "
+                      "Mantenha a pasta do projeto ou um único ZIP-fonte 0.13.0 na raiz."
                   )
 
-              archive, prefix, infos = archives[0]
-
+              archive, prefix, infos = candidates[0]
               shutil.rmtree(extraction, ignore_errors=True)
-              extraction.mkdir(parents=True)
-
-              total = 0
+              extraction.mkdir(parents=True, exist_ok=True)
+              total_size = 0
 
               with zipfile.ZipFile(archive) as zf:
                   for info in infos:
                       name = info.filename
                       item = PurePosixPath(name)
                       mode = info.external_attr >> 16
-
                       if (
                           item.is_absolute()
                           or ".." in item.parts
                           or "\\" in name
                           or "\x00" in name
+                          or (item.parts and item.parts[0].endswith(":"))
                           or stat.S_ISLNK(mode)
                       ):
-                          raise SystemExit(f"Unsafe ZIP entry: {name}")
+                          raise SystemExit(f"Caminho inseguro no ZIP: {name!r}")
 
-                      total += info.file_size
-
-                      if (
-                          info.file_size > 128 * 1024 * 1024
-                          or total > 768 * 1024 * 1024
-                      ):
-                          raise SystemExit("Source ZIP exceeds safety limit.")
-
+                      total_size += info.file_size
+                      if info.file_size > 128 * 1024 * 1024 or total_size > 768 * 1024 * 1024:
+                          raise SystemExit("ZIP fonte ultrapassa o limite seguro de 768 MiB.")
                       if info.is_dir():
                           continue
 
                       destination = extraction.joinpath(*item.parts)
-                      destination.parent.mkdir(
-                          parents=True,
-                          exist_ok=True
-                      )
-
-                      with zf.open(info) as source:
-                          with destination.open("wb") as target:
-                              shutil.copyfileobj(source, target)
-
-                      destination.chmod(
-                          0o755 if mode & 0o111 else 0o644
-                      )
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      with zf.open(info) as source, destination.open("wb") as target:
+                          shutil.copyfileobj(source, target)
+                      destination.chmod(0o755 if mode & 0o111 else 0o644)
 
               project = extraction / prefix if prefix else extraction
-
               if not valid(project):
-                  raise SystemExit("Extracted source is invalid.")
+                  raise SystemExit("A estrutura extraída não corresponde à fonte 0.13.0.")
 
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"PROJECT_DIR={project}\n")
-              f.write(
-                  "XWT_ASSET_PREFIX="
-                  f"X360-Web-Total-0.13.0-Xenon-Linux-"
-                  f"{os.environ['GITHUB_SHA'][:12]}\n"
+          manifest = project / "SOURCE-MANIFEST.sha256"
+          if manifest.is_file():
+              subprocess.run(
+                  ["sha256sum", "--check", "SOURCE-MANIFEST.sha256"],
+                  cwd=project,
+                  check=True,
               )
 
-          print("Validated project:", project)
+          # Keep the 32-bit Xenon boot image in images/, outside the PPC64 rootfs.
+          buildroot_config = project / "linux" / "buildroot.config"
+          config_lines = buildroot_config.read_text(encoding="utf-8").splitlines()
+          install_target = "BR2_LINUX_KERNEL_INSTALL_TARGET"
+          config_lines = [
+              line for line in config_lines
+              if not line.startswith(install_target + "=")
+              and line != f"# {install_target} is not set"
+          ]
+          config_lines.append(f"# {install_target} is not set")
+          buildroot_config.write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+
+          github_env = Path(os.environ["GITHUB_ENV"])
+          with github_env.open("a", encoding="utf-8") as env_file:
+              env_file.write(f"PROJECT_DIR={project}\n")
+              env_file.write(
+                  "XWT_ASSET_PREFIX="
+                  f"X360-Web-Total-{os.environ['XWT_VERSION']}-Xenon-Linux-"
+                  f"{os.environ['GITHUB_SHA'][:12]}\n"
+              )
+          print(f"Fonte validada: {project}")
           PY
 
-      # =========================================================
-      # 6. SOURCE INTEGRITY
-      # =========================================================
-
-      - name: Verify source integrity
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-
-          if [ -f SOURCE-MANIFEST.sha256 ]; then
-            sha256sum --check SOURCE-MANIFEST.sha256
-          fi
-
-      # =========================================================
-      # 7. TESTS
-      # =========================================================
-
-      - name: Run shell and Python tests
+      - name: Run source, shell, Python, C and NAND-safety tests
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -385,65 +307,33 @@ jobs:
             linux/overlay/usr/sbin/xwt-wifi-config.py \
             linux/overlay/usr/sbin/xwt-time-sync.py
 
-          cd scripts
-
-          python3 -m unittest -v \
-            test_package_linux_usb \
-            test_linux_network \
-            test_desktop
-
-          cd ..
+          (cd scripts && python3 -m unittest -v \
+            test_package_linux_usb test_linux_network test_desktop)
 
           python3 scripts/test_nand_boundary.py
 
-      # =========================================================
-      # 8. HOST REGRESSION TESTS
-      # =========================================================
-
-      - name: Build host regression tests
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cmake -S "$PROJECT_DIR/browser" \
-            -B "$RUNNER_TEMP/xwt-host-regression" \
+          cmake -S browser -B "$RUNNER_TEMP/xwt-host-regression" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+            -DCMAKE_C_FLAGS='-Wall -Wextra -Wpedantic -Werror'
+          cmake --build "$RUNNER_TEMP/xwt-host-regression" --parallel 2
+          ctest --test-dir "$RUNNER_TEMP/xwt-host-regression" \
+            --output-on-failure --no-tests=error
 
-          cmake --build "$RUNNER_TEMP/xwt-host-regression" --parallel 4
-
-          ctest \
-            --test-dir "$RUNNER_TEMP/xwt-host-regression" \
-            --output-on-failure \
-            --no-tests=error
-
-          rm -rf "$RUNNER_TEMP/xwt-host-regression"
-
-      # =========================================================
-      # 9. FETCH FREE60
-      # =========================================================
-
-      - name: Fetch Free60 Xenon support
+      - name: Fetch exact Free60 Xenon kernel support
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          DIR="$RUNNER_TEMP/free60-xenon"
-
-          git init "$DIR"
-
-          git -C "$DIR" remote add origin \
+          FREE60_DIR="$RUNNER_TEMP/free60-xenon"
+          git init "$FREE60_DIR"
+          git -C "$FREE60_DIR" remote add origin \
             https://github.com/Free60Project/linux-kernel-xbox360.git
+          git -C "$FREE60_DIR" fetch --depth=1 origin "$FREE60_COMMIT"
+          git -C "$FREE60_DIR" checkout --detach FETCH_HEAD
+          test "$(git -C "$FREE60_DIR" rev-parse HEAD)" = "$FREE60_COMMIT"
+          test -s "$FREE60_DIR/xenon-7.2.defconfig"
+          test -s "$FREE60_DIR/patch-7.2-xenon0.30.diff"
 
-          git -C "$DIR" fetch --depth=1 origin "$FREE60_COMMIT"
-          git -C "$DIR" checkout --detach FETCH_HEAD
-
-          test "$(git -C "$DIR" rev-parse HEAD)" = "$FREE60_COMMIT"
-
-          test -s "$DIR/xenon-7.2.defconfig"
-          test -s "$DIR/patch-7.2-xenon0.30.diff"
-
-          cp "$DIR/xenon-7.2.defconfig" \
+          cp "$FREE60_DIR/xenon-7.2.defconfig" \
             "$PROJECT_DIR/linux/xenon-7.2.defconfig"
 
           python3 - "$PROJECT_DIR/linux/xenon-7.2.defconfig" <<'PY'
@@ -452,7 +342,6 @@ jobs:
           from pathlib import Path
 
           path = Path(sys.argv[1])
-
           options = {
               "CONFIG_DRM_FBDEV_EMULATION": "y",
               "CONFIG_FRAMEBUFFER_CONSOLE": "y",
@@ -473,6 +362,7 @@ jobs:
               "CONFIG_DEVTMPFS_MOUNT": "y",
               "CONFIG_PROC_FS": "y",
               "CONFIG_SYSFS": "y",
+              "CONFIG_UEVENT_HELPER": "y",
               "CONFIG_INPUT_UINPUT": "m",
               "CONFIG_INPUT_JOYDEV": "m",
               "CONFIG_JOYSTICK_XPAD": "m",
@@ -480,25 +370,17 @@ jobs:
               "CONFIG_HID_GENERIC": "y",
               "CONFIG_SND_USB_AUDIO": "m",
           }
-
-          pattern = re.compile(
-              r"^(?:# )?(CONFIG_[A-Z0-9_]+)(?:=.*| is not set)$"
-          )
-
+          pattern = re.compile(r"^(?:# )?(CONFIG_[A-Z0-9_]+)(?:=.*| is not set)$")
           lines = []
-
           for line in path.read_text().splitlines():
               match = pattern.match(line)
-
               if not match or match.group(1) not in options:
                   lines.append(line)
-
-          lines.extend(f"{k}={v}" for k, v in options.items())
-
+          lines.extend(f"{name}={value}" for name, value in options.items())
           path.write_text("\n".join(lines) + "\n")
           PY
 
-          for option in \
+          for required in \
             '^CONFIG_PPC64=y$' \
             '^CONFIG_DRM_XENOS=y$' \
             '^CONFIG_SIS190=y$' \
@@ -508,165 +390,123 @@ jobs:
             '^CONFIG_INPUT_JOYDEV=m$' \
             '^CONFIG_INPUT_UINPUT=m$'
           do
-            grep -q "$option" "$PROJECT_DIR/linux/xenon-7.2.defconfig"
+            grep -q "$required" "$PROJECT_DIR/linux/xenon-7.2.defconfig" || {
+              echo "Free60 defconfig não contém opção obrigatória: $required" >&2
+              exit 1
+            }
           done
 
-          git -C "$DIR" rev-parse HEAD \
-            > "$RUNNER_TEMP/free60-commit.txt"
+          git -C "$FREE60_DIR" rev-parse HEAD \
+            | tee "$RUNNER_TEMP/free60-commit.txt"
 
-      # =========================================================
-      # 10. FETCH BUILDROOT
-      # =========================================================
-
-      - name: Fetch Buildroot
+      - name: Fetch exact Buildroot source
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          DIR="$RUNNER_TEMP/buildroot"
-
-          git init "$DIR"
-
-          git -C "$DIR" remote add origin \
+          BUILDROOT_DIR="$RUNNER_TEMP/buildroot"
+          git init "$BUILDROOT_DIR"
+          git -C "$BUILDROOT_DIR" remote add origin \
             https://github.com/buildroot/buildroot.git
+          git -C "$BUILDROOT_DIR" fetch --depth=1 origin "$BUILDROOT_COMMIT"
+          git -C "$BUILDROOT_DIR" checkout --detach FETCH_HEAD
+          test "$(git -C "$BUILDROOT_DIR" rev-parse HEAD)" = "$BUILDROOT_COMMIT"
+          git -C "$BUILDROOT_DIR" rev-parse HEAD \
+            | tee "$RUNNER_TEMP/buildroot-commit.txt"
 
-          git -C "$DIR" fetch --depth=1 origin "$BUILDROOT_COMMIT"
-          git -C "$DIR" checkout --detach FETCH_HEAD
-
-          test "$(git -C "$DIR" rev-parse HEAD)" = "$BUILDROOT_COMMIT"
-
-          git -C "$DIR" rev-parse HEAD \
-            > "$RUNNER_TEMP/buildroot-commit.txt"
-
-          df -h
-
-      # =========================================================
-      # 10.1. FIX KERNEL IMAGE INSTALLATION
-      # =========================================================
-
-      - name: Patch Buildroot kernel target installation
+      - name: Keep Xenon kernel image out of the PPC64 target rootfs
         shell: bash
         run: |
           set -Eeuo pipefail
-
           MAKEFILE="$RUNNER_TEMP/buildroot/linux/linux.mk"
           test -s "$MAKEFILE"
-
           python3 - "$MAKEFILE" <<'PY'
           import sys
           from pathlib import Path
-
           path = Path(sys.argv[1])
-          text = path.read_text()
-
+          text = path.read_text(encoding="utf-8")
           old = "\t$(LINUX_INSTALL_KERNEL_IMAGE_TO_TARGET)\n"
-
-          new = (
-              "\t# XWT: keep zImage.xenon in images only; "
-              "do not install it into the PPC64 root filesystem.\n"
-          )
-
+          new = "\t# XWT: keep zImage.xenon in images/; it is not a PPC64 userspace binary.\n"
           count = text.count(old)
-
           if count != 1:
-              raise SystemExit(
-                  f"Expected exactly one kernel installation call, "
-                  f"found {count}. Build stopped safely."
-              )
-
-          path.write_text(text.replace(old, new, 1))
-
-          print(
-              "OK: kernel image installation into the target "
-              "root filesystem was disabled."
-          )
+              raise SystemExit(f"Esperava uma chamada de instalação do kernel, encontrei {count}; build interrompido.")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          if "$(LINUX_INSTALL_KERNEL_IMAGE_TO_TARGET)" in path.read_text(encoding="utf-8"):
+              raise SystemExit("A chamada de instalação do kernel ainda existe.")
+          print("OK: zImage.xenon continuará apenas em images/.")
           PY
 
-          if grep -Fq \
-            '$(LINUX_INSTALL_KERNEL_IMAGE_TO_TARGET)' \
-            "$MAKEFILE"; then
-            echo "ERROR: kernel installation call still exists."
-            exit 1
-          fi
-
-      # =========================================================
-      # 11. CONFIGURE BUILDROOT
-      # =========================================================
-
-      - name: Configure Buildroot
+      - name: Configure and validate Buildroot toolchain and packages
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          mkdir -p "$BR2_DL_DIR"
-          mkdir -p "$CCACHE_DIR"
+          export BR2_DL_DIR="$HOME/.cache/xwt-buildroot-dl"
+          mkdir -p "$BR2_DL_DIR" "$HOME/.cache/xwt-buildroot-ccache"
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           mkdir -p "$OUTPUT"
-
           cp "$PROJECT_DIR/linux/buildroot.config" "$OUTPUT/.config"
-
           sed -i \
             -e "s|@PROJECT_ROOT@|$PROJECT_DIR|g" \
             -e "s|@FREE60_ROOT@|$RUNNER_TEMP/free60-xenon|g" \
             -e "s|@BUILDROOT_OUTPUT@|$OUTPUT|g" \
             "$OUTPUT/.config"
 
+          # Select Linux 7.2 headers explicitly. Buildroot's default "headers as kernel"
+          # path resolves to the generic 2.6 minimum here, which disables glibc and
+          # iproute2. Both packages need newer headers (glibc >= 3.2, iproute2 >= 3.4).
           python3 - "$OUTPUT/.config" "$HOME" <<'PY'
+          import re
           import sys
           from pathlib import Path
 
           config = Path(sys.argv[1])
           home = sys.argv[2]
-
+          lines = config.read_text().splitlines()
           values = {
               "BR2_KERNEL_HEADERS_7_2": "y",
               "BR2_TOOLCHAIN_BUILDROOT": "y",
               "BR2_TOOLCHAIN_BUILDROOT_GLIBC": "y",
               "BR2_PACKAGE_BUSYBOX_SHOW_OTHERS": "y",
               "BR2_CCACHE": "y",
-              "BR2_CCACHE_DIR":
-                  f'"{home}/.cache/xwt-buildroot-ccache"',
+              "BR2_CCACHE_DIR": f'"{home}/.cache/xwt-buildroot-ccache"',
           }
-
-          lines = config.read_text().splitlines()
-
           for symbol, value in values.items():
               lines = [
                   line for line in lines
                   if not line.startswith(symbol + "=")
                   and line != f"# {symbol} is not set"
               ]
-
               lines.append(f"{symbol}={value}")
-
-          # Keep the Xenon kernel image outside the PPC64 root filesystem.
-          symbol = "BR2_LINUX_KERNEL_INSTALL_TARGET"
-
+          install_target = "BR2_LINUX_KERNEL_INSTALL_TARGET"
           lines = [
               line for line in lines
-              if not line.startswith(symbol + "=")
-              and line != f"# {symbol} is not set"
+              if not line.startswith(install_target + "=")
+              and line != f"# {install_target} is not set"
           ]
-
-          lines.append("# BR2_LINUX_KERNEL_INSTALL_TARGET is not set")
-
+          lines.append(f"# {install_target} is not set")
           config.write_text("\n".join(lines) + "\n")
           PY
 
-          make -C "$RUNNER_TEMP/buildroot" \
-            O="$OUTPUT" olddefconfig \
-            2>&1 | tail -n 150
+          make -C "$RUNNER_TEMP/buildroot" O="$OUTPUT" olddefconfig \
+            2>&1 | tee "$RUNNER_TEMP/buildroot-configure.log"
 
-          CONFIG="$OUTPUT/.config"
-
+          CONFIG_FILE="$OUTPUT/.config"
           require_config() {
-            grep -Fqx "$1" "$CONFIG" || {
-              echo "Missing Buildroot option: $1" >&2
+            expected="$1"
+            symbol="${expected%%=*}"
+            if ! grep -Fqx -- "$expected" "$CONFIG_FILE"; then
+              echo "Buildroot não preservou a configuração exigida:" >&2
+              echo "  esperado: $expected" >&2
+              grep -E "^${symbol}=|^# ${symbol} is not set$" \
+                "$CONFIG_FILE" >&2 || true
+              echo "Toolchain resolvida:" >&2
+              grep -E '^(BR2_KERNEL_HEADERS_|BR2_TOOLCHAIN_BUILDROOT|BR2_TOOLCHAIN_USES_|BR2_TOOLCHAIN_HAS_THREADS|BR2_USE_WCHAR)=' \
+                "$CONFIG_FILE" >&2 || true
               exit 1
-            }
+            fi
           }
 
+          # Platform and ABI.
           require_config 'BR2_powerpc64=y'
           require_config 'BR2_powerpc_970=y'
           require_config 'BR2_KERNEL_HEADERS_7_2=y'
@@ -675,25 +515,30 @@ jobs:
           require_config 'BR2_TOOLCHAIN_USES_GLIBC=y'
           require_config 'BR2_TOOLCHAIN_HAS_THREADS=y'
           require_config 'BR2_USE_WCHAR=y'
+          require_config '# BR2_LINUX_KERNEL_INSTALL_TARGET is not set'
 
+          # NetSurf must use the framebuffer SDL frontend, not X11/Wayland.
           require_config 'BR2_PACKAGE_NETSURF=y'
           require_config 'BR2_PACKAGE_NETSURF_SDL=y'
           require_config 'BR2_PACKAGE_SDL=y'
           require_config 'BR2_PACKAGE_SDL_FBCON=y'
           require_config 'BR2_PACKAGE_SDL_TTF=y'
 
+          # Ethernet/Wi-Fi tools and firmware database.
           require_config 'BR2_PACKAGE_WPA_SUPPLICANT=y'
           require_config 'BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y'
           require_config 'BR2_PACKAGE_WIRELESS_REGDB=y'
           require_config 'BR2_PACKAGE_IW=y'
           require_config 'BR2_PACKAGE_IPROUTE2=y'
 
+          # Real HTTPS backend and trust store; do not test the hidden FORCE_TLS symbol.
           require_config 'BR2_PACKAGE_LIBCURL=y'
           require_config 'BR2_PACKAGE_LIBCURL_CURL=y'
           require_config 'BR2_PACKAGE_LIBCURL_OPENSSL=y'
           require_config 'BR2_PACKAGE_OPENSSL=y'
           require_config 'BR2_PACKAGE_CA_CERTIFICATES=y'
 
+          # Native desktop dependencies and system tools.
           require_config 'BR2_PACKAGE_PYTHON3=y'
           require_config 'BR2_PACKAGE_DIALOG=y'
           require_config 'BR2_PACKAGE_KMOD=y'
@@ -703,6 +548,7 @@ jobs:
           require_config 'BR2_PACKAGE_ALSA_LIB=y'
           require_config 'BR2_PACKAGE_ALSA_UTILS=y'
 
+          # Kernel image and compressed CPIO initramfs.
           require_config 'BR2_LINUX_KERNEL=y'
           require_config 'BR2_LINUX_KERNEL_CUSTOM_VERSION=y'
           require_config 'BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="7.2"'
@@ -710,232 +556,208 @@ jobs:
           require_config 'BR2_TARGET_ROOTFS_CPIO=y'
           require_config 'BR2_TARGET_ROOTFS_CPIO_GZIP=y'
 
-          require_config '# BR2_LINUX_KERNEL_INSTALL_TARGET is not set'
+          grep -Fq "$PROJECT_DIR/linux/post-build.sh" "$CONFIG_FILE"
+          grep -Fq "$RUNNER_TEMP/buildroot-output" "$CONFIG_FILE"
+          echo "Buildroot validado: PowerPC64/glibc + NetSurf SDL/framebuffer + HTTPS/OpenSSL."
 
-          if grep -q '^BR2_LINUX_KERNEL_INSTALL_TARGET=y$' "$CONFIG"; then
-            echo "ERROR: Kernel must not be installed into the PPC64 rootfs /boot."
-            exit 1
-          fi
-
-          grep -Fq "$PROJECT_DIR/linux/post-build.sh" "$CONFIG"
-
-          echo "=== DISK BEFORE BUILD ==="
-          df -h
-
-          AVAILABLE=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
-
-          if [ "$AVAILABLE" -lt 8388608 ]; then
-            echo "ERROR: Less than 8 GB available before compilation."
-            exit 1
-          fi
-
-      # =========================================================
-      # 11.1. PREPARE SDL STAGING AND POST-BUILD ENVIRONMENT
-      # =========================================================
-
-      - name: Prepare SDL staging and post-build wrapper
+      - name: Prepare SDL staging and correct the post-build SDL check
         shell: bash
         run: |
           set -Eeuo pipefail
-
           BUILDROOT_DIR="$RUNNER_TEMP/buildroot"
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           CONFIG="$OUTPUT/.config"
           ORIGINAL="$PROJECT_DIR/linux/post-build.sh"
+          PATCHED="$PROJECT_DIR/linux/xwt-post-build-effective.sh"
           WRAPPER="$RUNNER_TEMP/xwt-post-build-wrapper.sh"
 
-          # Confirm both packages survived Buildroot's olddefconfig pass.
           grep -Fqx 'BR2_PACKAGE_SDL=y' "$CONFIG"
           grep -Fqx 'BR2_PACKAGE_SDL_TTF=y' "$CONFIG"
+          test -s "$ORIGINAL"
 
-          # Resolve the staging path from Buildroot itself, rather than
-          # assuming a fixed PowerPC toolchain/sysroot directory.
           STAGING_DIR="$(
-            make -s -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR |
-              sed -n 's/^STAGING_DIR[[:space:]]*=[[:space:]]*//p' |
-              tail -n 1
+            make -s -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR \
+              | sed -n 's/^STAGING_DIR[[:space:]]*=[[:space:]]*//p' \
+              | tail -n 1
           )"
-
           if [ -z "$STAGING_DIR" ]; then
-            echo "ERROR: Could not resolve Buildroot STAGING_DIR."
+            echo "ERROR: Buildroot não retornou STAGING_DIR." >&2
             make -C "$BUILDROOT_DIR" O="$OUTPUT" printvars VARS=STAGING_DIR || true
             exit 1
           fi
-
           case "$STAGING_DIR" in
             /*) ;;
             *) STAGING_DIR="$OUTPUT/$STAGING_DIR" ;;
           esac
+          STAGING_DIR="$(realpath -m "$STAGING_DIR")"
+          HOST_DIR="$OUTPUT/host"
+          TARGET_DIR="$OUTPUT/target"
+          mkdir -p "$STAGING_DIR/usr/include/SDL" "$STAGING_DIR/usr/include"
 
-          mkdir -p "$STAGING_DIR/usr/include/SDL"
-
-          # Build SDL_ttf and its declared SDL dependency before the full build.
           JOBS="$(nproc)"
           if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
-
           make -C "$BUILDROOT_DIR" O="$OUTPUT" -j"$JOBS" sdl_ttf \
-            2>&1 | tail -n 180
+            2>&1 | tee "$RUNNER_TEMP/buildroot-sdl-headers.log"
 
-          # In per-package staging mode, a package header may exist in its
-          # package build directory even when the shared sysroot is incomplete.
           for header in SDL.h SDL_ttf.h; do
-            destination="$STAGING_DIR/usr/include/SDL/$header"
-
-            if [ ! -s "$destination" ]; then
-              source="$(
-                find "$OUTPUT/build" "$OUTPUT/per-package" "$OUTPUT/host" \
-                  -type f -name "$header" -print -quit 2>/dev/null || true
-              )"
-
-              if [ -z "$source" ]; then
-                echo "ERROR: $header is missing from Buildroot staging and package output."
-                find "$OUTPUT" -type f \
-                  \( -name SDL.h -o -name SDL_ttf.h \) \
-                  -print 2>/dev/null || true
-                exit 1
-              fi
-
-              install -m 0644 "$source" "$destination"
-              echo "Restored SDL header: $header from $source"
+            source="$(find "$OUTPUT/build" "$OUTPUT/per-package" "$HOST_DIR" "$STAGING_DIR" \
+              -type f -name "$header" -print -quit 2>/dev/null || true)"
+            if [ -z "$source" ]; then
+              echo "ERROR: $header não foi produzido pelo pacote SDL/SDL_ttf." >&2
+              find "$OUTPUT" -type f \
+                \( -name SDL.h -o -name SDL_ttf.h \) -print 2>/dev/null || true
+              exit 1
             fi
+            install -D -m 0644 "$source" "$STAGING_DIR/usr/include/SDL/$header"
+            install -D -m 0644 "$source" "$STAGING_DIR/usr/include/$header"
+            echo "SDL header confirmado: $header ($source)"
           done
+
+          # The earlier guard used a different staging path. Patch only that guard,
+          # retaining its failure body and making the check use Buildroot's actual sysroot.
+          python3 - "$ORIGINAL" "$PATCHED" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          original, patched = map(Path, sys.argv[1:])
+          lines = original.read_text(encoding="utf-8").splitlines()
+          marker = "SDL/SDL_ttf headers are missing from Buildroot staging"
+          matches = [i for i, line in enumerate(lines) if marker in line]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"Esperava uma mensagem de validação SDL no post-build.sh; encontrei {len(matches)}."
+              )
+          message_index = matches[0]
+          start = None
+          for i in range(message_index, -1, -1):
+              if re.match(r"^\s*if\b", lines[i]):
+                  start = i
+                  break
+          if start is None:
+              raise SystemExit("Não encontrei o if que protege a validação SDL.")
+          then_index = None
+          for i in range(start, message_index + 1):
+              if re.search(r"\bthen\b", lines[i]):
+                  then_index = i
+                  break
+          if then_index is None:
+              raise SystemExit("Não encontrei o then do teste SDL.")
+          condition = "\n".join(lines[start:then_index + 1])
+          if "SDL" not in condition or "STAGING" not in condition:
+              raise SystemExit("O if localizado não parece ser o teste de cabeçalhos SDL.")
+          replacement = [
+              'if [ ! -s "${XWT_BUILDROOT_STAGING_DIR}/usr/include/SDL/SDL.h" ] || [ ! -s "${XWT_BUILDROOT_STAGING_DIR}/usr/include/SDL/SDL_ttf.h" ]; then',
+          ]
+          lines[start:then_index + 1] = replacement
+          for i, line in enumerate(lines):
+              if re.match(r"^\s*(?:export\s+)?STAGING_DIR\s*=", line):
+                  lines[i] = 'STAGING_DIR="${XWT_BUILDROOT_STAGING_DIR:?}"; export STAGING_DIR'
+          patched.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          patched.chmod(0o755)
+          print(f"Post-build SDL guard corrigido em {patched}.")
+          PY
+          sh -n "$PATCHED"
 
           cat > "$WRAPPER" <<'SH'
           #!/bin/sh
           set -eu
-
           : "${XWT_BUILDROOT_STAGING_DIR:?missing Buildroot staging directory}"
           : "${XWT_BUILDROOT_HOST_DIR:?missing Buildroot host directory}"
           : "${XWT_BUILDROOT_OUTPUT:?missing Buildroot output directory}"
-          : "${XWT_PROJECT_DIR:?missing project directory}"
-
+          : "${XWT_PATCHED_POST_BUILD_SCRIPT:?missing patched post-build script}"
           export STAGING_DIR="$XWT_BUILDROOT_STAGING_DIR"
           export HOST_DIR="$XWT_BUILDROOT_HOST_DIR"
-          export TARGET_DIR="${1:-}"
-
-          SDL_INCLUDE="$STAGING_DIR/usr/include/SDL"
-          mkdir -p "$SDL_INCLUDE"
-
-          # Recheck at hook execution time. Buildroot may have changed package
-          # staging between the early preflight and target-finalize.
+          export BUILDROOT_OUTPUT="$XWT_BUILDROOT_OUTPUT"
+          export TARGET_DIR="${1:-$XWT_BUILDROOT_OUTPUT/target}"
+          SDL_DIR="$STAGING_DIR/usr/include/SDL"
+          mkdir -p "$SDL_DIR" "$STAGING_DIR/usr/include"
           for header in SDL.h SDL_ttf.h; do
-            destination="$SDL_INCLUDE/$header"
-
-            if [ ! -s "$destination" ]; then
-              source="$(
-                find "$XWT_BUILDROOT_OUTPUT/build" \
-                     "$XWT_BUILDROOT_OUTPUT/per-package" \
-                     "$XWT_BUILDROOT_HOST_DIR" \
-                     -type f -name "$header" -print -quit 2>/dev/null || true
-              )"
-
+            if [ ! -s "$SDL_DIR/$header" ]; then
+              source="$(find "$XWT_BUILDROOT_OUTPUT/build" \
+                "$XWT_BUILDROOT_OUTPUT/per-package" "$XWT_BUILDROOT_HOST_DIR" \
+                "$STAGING_DIR" -type f -name "$header" -print -quit 2>/dev/null || true)"
               if [ -z "$source" ]; then
-                echo "ERROR: $header is absent from staging and package output." >&2
-                find "$XWT_BUILDROOT_OUTPUT" \
-                  -type f \( -name SDL.h -o -name SDL_ttf.h \) \
-                  -print 2>/dev/null || true
+                echo "ERROR: $header ausente no staging e nos pacotes Buildroot." >&2
+                find "$XWT_BUILDROOT_OUTPUT" -type f \
+                  \( -name SDL.h -o -name SDL_ttf.h \) -print 2>/dev/null || true
                 exit 1
               fi
-
-              install -m 0644 "$source" "$destination"
-              echo "Restored SDL header at post-build time: $header from $source"
+              install -D -m 0644 "$source" "$SDL_DIR/$header"
             fi
+            install -D -m 0644 "$SDL_DIR/$header" "$STAGING_DIR/usr/include/$header"
           done
-
-          exec "$XWT_PROJECT_DIR/linux/post-build.sh" "$@"
+          test -s "$SDL_DIR/SDL.h"
+          test -s "$SDL_DIR/SDL_ttf.h"
+          exec "$XWT_PATCHED_POST_BUILD_SCRIPT" "$@"
           SH
-
           chmod 0755 "$WRAPPER"
 
           python3 - "$CONFIG" "$ORIGINAL" "$WRAPPER" <<'PY'
           import sys
           from pathlib import Path
-
           config, original, wrapper = map(Path, sys.argv[1:])
-          text = config.read_text()
-          old = str(original)
-          new = str(wrapper)
-
-          if text.count(old) != 1:
-              raise SystemExit(
-                  "Expected exactly one project post-build script path "
-                  "in Buildroot .config."
-              )
-
-          config.write_text(text.replace(old, new, 1))
+          content = config.read_text(encoding="utf-8")
+          old, new = str(original), str(wrapper)
+          if content.count(old) != 1:
+              raise SystemExit("Esperava exatamente um caminho post-build no .config.")
+          config.write_text(content.replace(old, new, 1), encoding="utf-8")
           PY
-
-          make -C "$BUILDROOT_DIR" O="$OUTPUT" olddefconfig 2>&1 | tail -n 100
+          make -C "$BUILDROOT_DIR" O="$OUTPUT" olddefconfig \
+            2>&1 | tee "$RUNNER_TEMP/buildroot-postbuild-config.log"
           grep -Fq "$WRAPPER" "$CONFIG"
 
           {
             echo "XWT_BUILDROOT_STAGING_DIR=$STAGING_DIR"
-            echo "XWT_BUILDROOT_HOST_DIR=$OUTPUT/host"
+            echo "XWT_BUILDROOT_HOST_DIR=$HOST_DIR"
             echo "XWT_BUILDROOT_OUTPUT=$OUTPUT"
             echo "XWT_PROJECT_DIR=$PROJECT_DIR"
+            echo "XWT_PATCHED_POST_BUILD_SCRIPT=$PATCHED"
           } >> "$GITHUB_ENV"
 
-          echo "Buildroot staging: $STAGING_DIR"
+          echo "Buildroot staging real: $STAGING_DIR"
           echo "Post-build wrapper: $WRAPPER"
-          echo "SDL and SDL_ttf headers are present before target-finalize."
+          echo "Post-build corrigido: $PATCHED"
+          test -s "$STAGING_DIR/usr/include/SDL/SDL.h"
+          test -s "$STAGING_DIR/usr/include/SDL/SDL_ttf.h"
 
-      # =========================================================
-      # 12. COMPILE
-      # =========================================================
-
-      - name: Compile Linux kernel and root filesystem
+      - name: Build Linux kernel, modules, desktop, browser and root filesystem
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          mkdir -p "$BR2_DL_DIR"
-
-          ccache --max-size=1G || true
-
+          export BR2_DL_DIR="$HOME/.cache/xwt-buildroot-dl"
           JOBS="$(nproc)"
           if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
+          echo "Compilação Buildroot com $JOBS workers."
+          ccache --zero-stats || true
 
-          echo "Buildroot workers: $JOBS"
-          echo "Compiler cache: 1 GB"
-          echo "Download cache: $BR2_DL_DIR"
-
-          echo "=== DISK BEFORE COMPILATION ==="
-          df -h
-
-          if ! make -C "$RUNNER_TEMP/buildroot" \
+          make -C "$RUNNER_TEMP/buildroot" \
             O="$RUNNER_TEMP/buildroot-output" \
             -j"$JOBS" \
-            2>&1 | tail -n 250
-          then
-            echo "BUILDROOT COMPILATION FAILED"
-            df -h
-            exit 1
-          fi
-          fi
+            2>&1 | tee "$RUNNER_TEMP/buildroot-build.log"
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           TARGET="$OUTPUT/target"
+          KERNEL_IMAGE="$OUTPUT/images/zImage.xenon"
+          ROOTFS_IMAGE="$OUTPUT/images/rootfs.cpio.gz"
 
-          KERNEL="$OUTPUT/images/zImage.xenon"
-          INITRD="$OUTPUT/images/rootfs.cpio.gz"
-
-          test -s "$KERNEL"
-          test -s "$INITRD"
-
-          gzip -t "$INITRD"
-          file "$KERNEL" "$INITRD"
+          test -s "$KERNEL_IMAGE"
+          test -s "$ROOTFS_IMAGE"
+          if [ -e "$TARGET/boot/zImage.xenon" ]; then
+            echo "ERRO: zImage.xenon foi instalado no rootfs PPC64; deve ficar somente em images/." >&2
+            exit 1
+          fi
+          gzip -t "$ROOTFS_IMAGE"
+          file "$KERNEL_IMAGE" "$ROOTFS_IMAGE"
 
           test -x "$TARGET/usr/sbin/xwt-desktop"
           test -x "$TARGET/usr/sbin/xwt-gamepad-keys"
-
           test -s "$TARGET/usr/share/fonts/dejavu/DejaVuSans.ttf"
 
-          KERNEL_CONFIG="$(find "$OUTPUT/build" -maxdepth 4 \
-            -type f -path '*/linux-*/.config' -print -quit)"
-
+          KERNEL_CONFIG="$(find "$OUTPUT/build" -maxdepth 4 -type f \
+            -path '*/linux-*/.config' -print -quit)"
           test -s "$KERNEL_CONFIG"
-
-          for option in \
+          for required in \
             '^CONFIG_PPC_XENON=y$' \
             '^CONFIG_PPC64=y$' \
             '^CONFIG_DRM_XENOS=y$' \
@@ -947,68 +769,125 @@ jobs:
             '^CONFIG_MAC80211=m$' \
             '^CONFIG_JOYSTICK_XPAD=m$' \
             '^CONFIG_INPUT_JOYDEV=m$' \
-            '^CONFIG_INPUT_UINPUT=m$'
+            '^CONFIG_INPUT_UINPUT=m$' \
+            '^CONFIG_USB_HID=y$' \
+            '^CONFIG_HID_GENERIC=y$' \
+            '^CONFIG_SND_USB_AUDIO=m$'
           do
-            grep -q "$option" "$KERNEL_CONFIG"
+            grep -q "$required" "$KERNEL_CONFIG" || {
+              echo "Configuração do kernel ausente: $required" >&2
+              exit 1
+            }
           done
 
           for module in xpad joydev uinput; do
             find "$TARGET/lib/modules" -type f \
-              \( -name "$module.ko" \
-              -o -name "$module.ko.xz" \
-              -o -name "$module.ko.zst" \) \
-              -print -quit | grep -q .
+              \( -name "$module.ko" -o -name "$module.ko.xz" -o -name "$module.ko.zst" \) \
+              -print -quit | grep -q . || {
+                echo "Módulo do kernel não foi instalado: $module" >&2
+                exit 1
+              }
           done
 
-          ccache --show-stats
+          python3 - "$ROOTFS_IMAGE" <<'PY'
+          import gzip
+          import sys
+          from pathlib import PurePosixPath
 
-          echo "=== DISK AFTER COMPILATION ==="
-          df -h
+          def align4(number):
+              return (number + 3) & ~3
 
-      # =========================================================
-      # 12.1. SAVE CACHE EVEN IF COMPILATION FAILS
-      # =========================================================
+          names = set()
+          executable = set()
+          module_names = set()
+          with gzip.open(sys.argv[1], "rb") as archive:
+              while True:
+                  header = archive.read(110)
+                  if not header:
+                      break
+                  if len(header) != 110 or header[:6] not in (b"070701", b"070702"):
+                      raise SystemExit("Cabeçalho CPIO newc inválido.")
+                  fields = [int(header[pos:pos + 8], 16) for pos in range(6, 110, 8)]
+                  mode, size, name_size = fields[1], fields[6], fields[11]
+                  name_raw = archive.read(name_size)
+                  if len(name_raw) != name_size or not name_raw.endswith(b"\0"):
+                      raise SystemExit("Nome de arquivo CPIO inválido.")
+                  name = name_raw[:-1].decode("utf-8", "replace").lstrip("./")
+                  member = PurePosixPath(name)
+                  if member.is_absolute() or ".." in member.parts:
+                      raise SystemExit(f"Caminho inseguro dentro do CPIO: {name}")
+                  archive.seek(align4(110 + name_size) - (110 + name_size), 1)
+                  if name == "TRAILER!!!":
+                      break
+                  names.add(name)
+                  if mode & 0o111:
+                      executable.add(name)
+                  if "/lib/modules/" in "/" + name:
+                      module_names.add(name)
+                  archive.seek(size, 1)
+                  archive.seek(align4(size) - size, 1)
 
-      - name: Save Buildroot caches (including after failed builds)
+          required_files = {
+              "etc/dialogrc", "etc/inittab", "etc/mdev.conf",
+              "etc/wpa_supplicant/wpa_supplicant.conf", "sbin/mdev",
+              "etc/init.d/S15gamepad", "etc/init.d/S30storage",
+              "etc/init.d/S40network", "etc/init.d/S45wifi", "etc/init.d/S46time",
+              "usr/sbin/xwt-system-menu", "usr/sbin/xwt-system-menu-text",
+              "usr/sbin/xwt-desktop", "usr/sbin/xwt-audio", "usr/sbin/xwt-network",
+              "usr/sbin/xwt-wifi", "usr/sbin/xwt-wifi-config.py",
+              "usr/sbin/xwt-time-sync.py", "usr/sbin/xwt-gamepad-keys",
+              "usr/share/fonts/dejavu/DejaVuSans.ttf",
+          }
+          missing = sorted(required_files - names)
+          if missing:
+              raise SystemExit("Arquivos ausentes no rootfs: " + ", ".join(missing))
+
+          required_exec = {
+              "etc/init.d/S15gamepad", "etc/init.d/S30storage", "etc/init.d/S40network",
+              "etc/init.d/S45wifi", "etc/init.d/S46time",
+              "usr/sbin/xwt-system-menu", "usr/sbin/xwt-system-menu-text",
+              "usr/sbin/xwt-desktop", "usr/sbin/xwt-audio", "usr/sbin/xwt-network",
+              "usr/sbin/xwt-wifi", "usr/sbin/xwt-wifi-config.py",
+              "usr/sbin/xwt-time-sync.py", "usr/sbin/xwt-gamepad-keys",
+          }
+          missing_exec = sorted(required_exec - executable)
+          if missing_exec:
+              raise SystemExit("Arquivos sem permissão de execução: " + ", ".join(missing_exec))
+
+          for module in ("xpad.ko", "joydev.ko", "uinput.ko"):
+              if not any(name.endswith(module) or name.endswith(module + ".xz") or name.endswith(module + ".zst") for name in module_names):
+                  raise SystemExit(f"Módulo ausente dentro do initramfs: {module}")
+          print(f"Initramfs validado: {len(names)} entradas; módulos, serviços e ferramentas conferidos.")
+          PY
+
+          ccache --show-stats || true
+
+      - name: Save Buildroot caches even after failed builds
         if: ${{ always() && steps.buildroot-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
-            ~/.cache/xwt-buildroot-ccache
             ~/.cache/xwt-buildroot-dl
-          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v2
+            ~/.cache/xwt-buildroot-ccache
+          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v3
 
-      # =========================================================
-      # 13. CREATE USB PACKAGE
-      # =========================================================
-
-      - name: Create verified USB package
+      - name: Run final tests and create verified USB boot package
         shell: bash
         run: |
           set -Eeuo pipefail
-
           python3 "$PROJECT_DIR/scripts/package_linux_usb.py" \
             --kernel "$RUNNER_TEMP/buildroot-output/images/zImage.xenon" \
             --initrd "$RUNNER_TEMP/buildroot-output/images/rootfs.cpio.gz" \
             --project "$PROJECT_DIR" \
             --output "$RUNNER_TEMP/$XWT_ASSET_PREFIX-USB.zip"
-
           sha256sum "$RUNNER_TEMP/$XWT_ASSET_PREFIX-USB.zip" \
-            > "$RUNNER_TEMP/USB-SHA256.txt"
+            | tee "$RUNNER_TEMP/USB-SHA256.txt"
 
-          test -s "$RUNNER_TEMP/$XWT_ASSET_PREFIX-USB.zip"
-
-      # =========================================================
-      # 14. SOURCE ARCHIVE
-      # =========================================================
-
-      - name: Create source archive
+      - name: Create deterministic source archive and release manifest
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          python3 - "$PROJECT_DIR" \
-            "$RUNNER_TEMP/$XWT_ASSET_PREFIX-source.zip" <<'PY'
+          python3 - "$PROJECT_DIR" "$RUNNER_TEMP/$XWT_ASSET_PREFIX-source.zip" <<'PY'
           import stat
           import sys
           import zipfile
@@ -1016,171 +895,101 @@ jobs:
 
           root = Path(sys.argv[1]).resolve()
           output = Path(sys.argv[2])
+          ignored_dirs = {".git", "__pycache__", ".pytest_cache", "build", "output", "CMakeFiles"}
+          ignored_suffixes = {".o", ".a", ".so", ".elf", ".pyc", ".zip"}
+          files = []
+          for path in sorted(root.rglob("*")):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              relative = path.relative_to(root)
+              if any(part in ignored_dirs for part in relative.parts):
+                  continue
+              if path.suffix.lower() in ignored_suffixes:
+                  continue
+              if relative.as_posix() in {
+                  "SOURCE-MANIFEST.sha256",
+                  "linux/xwt-post-build-effective.sh",
+              }:
+                  continue
+              files.append((relative.as_posix(), path))
 
-          ignored_dirs = {
-              ".git",
-              "__pycache__",
-              ".pytest_cache",
-              "build",
-              "output",
-              "CMakeFiles"
-          }
-
-          ignored_suffixes = {
-              ".o",
-              ".a",
-              ".so",
-              ".elf",
-              ".pyc",
-              ".zip"
-          }
-
-          with zipfile.ZipFile(
-              output,
-              "w",
-              zipfile.ZIP_DEFLATED,
-              compresslevel=6
-          ) as archive:
-
-              for path in sorted(root.rglob("*")):
-                  if not path.is_file() or path.is_symlink():
-                      continue
-
-                  relative = path.relative_to(root)
-
-                  if any(part in ignored_dirs for part in relative.parts):
-                      continue
-
-                  if path.suffix.lower() in ignored_suffixes:
-                      continue
-
-                  if relative.as_posix() == "SOURCE-MANIFEST.sha256":
-                      continue
-
-                  info = zipfile.ZipInfo(
-                      relative.as_posix(),
-                      (2026, 1, 1, 0, 0, 0)
-                  )
-
+          with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for relative, path in files:
+                  info = zipfile.ZipInfo(relative, (2026, 1, 1, 0, 0, 0))
                   mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
                   info.external_attr = (stat.S_IFREG | mode) << 16
-
-                  with path.open("rb") as source:
-                      archive.writestr(info, source.read())
+                  archive.writestr(info, path.read_bytes())
 
           with zipfile.ZipFile(output) as archive:
               if archive.testzip():
-                  raise SystemExit("Invalid source ZIP CRC.")
-
-          print("Source archive created:", output)
+                  raise SystemExit("Falha de CRC no ZIP-fonte.")
+              for name in (
+                  "linux/post-build.sh",
+                  "linux/overlay/etc/init.d/S40network",
+                  "linux/overlay/etc/init.d/S45wifi",
+              ):
+                  info = archive.getinfo(name)
+                  if not ((info.external_attr >> 16) & 0o111):
+                      raise SystemExit(f"Permissão executável perdida: {name}")
+          print(f"ZIP-fonte validado: {output.stat().st_size} bytes.")
           PY
 
-      # =========================================================
-      # 15. RELEASE MANIFEST
-      # =========================================================
+          USB_NAME="$XWT_ASSET_PREFIX-USB.zip"
+          SOURCE_NAME="$XWT_ASSET_PREFIX-source.zip"
+          USB_SHA="$(sha256sum "$RUNNER_TEMP/$USB_NAME" | cut -d ' ' -f1)"
+          SOURCE_SHA="$(sha256sum "$RUNNER_TEMP/$SOURCE_NAME" | cut -d ' ' -f1)"
 
-      - name: Generate release manifest
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          USB="$XWT_ASSET_PREFIX-USB.zip"
-          SOURCE="$XWT_ASSET_PREFIX-source.zip"
-
-          USB_SHA="$(sha256sum "$RUNNER_TEMP/$USB" | cut -d ' ' -f1)"
-          SOURCE_SHA="$(sha256sum "$RUNNER_TEMP/$SOURCE" | cut -d ' ' -f1)"
-
-          python3 - "$RUNNER_TEMP/latest.json" \
-            "$GITHUB_REPOSITORY" "$GITHUB_SHA" \
-            "$USB" "$SOURCE" "$USB_SHA" "$SOURCE_SHA" <<'PY'
+          python3 - "$RUNNER_TEMP/latest.json" "$GITHUB_REPOSITORY" \
+            "$GITHUB_SHA" "$USB_NAME" "$SOURCE_NAME" "$USB_SHA" "$SOURCE_SHA" <<'PY'
           import json
           import sys
           from pathlib import Path
 
-          output, repo, commit, usb, source, usb_sha, source_sha = sys.argv[1:]
-
+          output, repository, commit, usb, source, usb_sha, source_sha = sys.argv[1:]
           tag = f"xwt-v0.13.0-linux-{commit[:12]}"
-          base = f"https://github.com/{repo}/releases/download/{tag}"
-
+          base = f"https://github.com/{repository}/releases/download/{tag}"
           manifest = {
               "product": "X360 Web Total",
               "version": "0.13.0",
               "revision": "linux-xenon-desktop-shell",
+              "channel": "prerelease",
               "commit": commit,
               "release_tag": tag,
               "assets": {
                   "usb_package": f"{base}/{usb}",
-                  "source": f"{base}/{source}"
+                  "source": f"{base}/{source}",
               },
-              "sha256": {
-                  "usb_package": usb_sha,
-                  "source": source_sha
-              },
-              "kernel": "Linux 7.2 Xenon / Xenos DRM / SIS190",
-              "browser": "NetSurf SDL framebuffer",
-              "tls": "libcurl / OpenSSL / CA certificates",
+              "sha256": {"usb_package": usb_sha, "source": source_sha},
+              "kernel": "Linux 7.2 Xenon port / Xenos DRM / SIS190",
+              "desktop": "Native SDL 1.2 + SDL_ttf framebuffer shell, file explorer, system panel, terminal and audio tools",
+              "browser": "NetSurf SDL framebuffer / libcurl / OpenSSL / CA certificates",
+              "network": "DHCP, default route, DNS and validated HTTPS probe",
+              "wifi": "USB WLAN only; compatibility depends on the exact adapter chipset and firmware",
+              "youtube": "Not certified; modern YouTube playback is not claimed",
               "nand_write": False,
-              "physical_console_tested": False
+              "physical_console_tested": False,
           }
-
-          Path(output).write_text(
-              json.dumps(manifest, indent=2) + "\n",
-              encoding="utf-8"
-          )
+          Path(output).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
           PY
 
           cat > "$RUNNER_TEMP/BUILD-REPORT.txt" <<EOF
-          X360 Web Total $XWT_VERSION
-          Revision: $XWT_REVISION
-          Commit: $GITHUB_SHA
-          Buildroot: $BUILDROOT_COMMIT
-          Free60: $FREE60_COMMIT
-          Target: Xbox 360 Xenon / PowerPC64
-          Kernel: Linux 7.2
-          Browser: NetSurf SDL framebuffer
-          TLS: libcurl + OpenSSL
-          Boot: XeLL Reloaded / USB
-          NAND writes: none
-          Physical console testing: required
+          X360 Web Total ${XWT_VERSION}
+          Revision: ${XWT_REVISION}
+          Commit: ${GITHUB_SHA}
+          Buildroot: ${BUILDROOT_COMMIT}
+          Free60: ${FREE60_COMMIT}
+          Target: Xbox 360 Xenon / PowerPC64 big-endian kernel and 32-bit Xenon boot image
+          Browser: NetSurf SDL/framebuffer; not Chromium
+          TLS: libcurl + OpenSSL + CA certificates
+          Boot: XeLL Reloaded kboot.conf from USB; no NAND writes
+          Physical console test: not performed by GitHub Actions
           EOF
 
-          cd "$RUNNER_TEMP"
+          (cd "$RUNNER_TEMP" && \
+            sha256sum latest.json BUILD-REPORT.txt \
+              "$USB_NAME" "$SOURCE_NAME" > SHA256SUMS.txt)
 
-          sha256sum latest.json BUILD-REPORT.txt \
-            "$USB" "$SOURCE" > SHA256SUMS.txt
-
-      # =========================================================
-      # 16. REMOVE TEMPORARY BUILD FILES
-      # =========================================================
-
-      - name: Remove temporary build data
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "Removing temporary Buildroot source and output..."
-
-          rm -rf \
-            "$RUNNER_TEMP/buildroot-output" \
-            "$RUNNER_TEMP/buildroot" \
-            "$RUNNER_TEMP/free60-xenon" \
-            "$RUNNER_TEMP/xwt-host-regression"
-
-          # Keep Buildroot download and compiler caches.
-          echo "Download cache preserved: $BR2_DL_DIR"
-          echo "Compiler cache preserved: $CCACHE_DIR"
-
-          echo "=== DISK BEFORE ARTIFACT UPLOAD ==="
-          df -h
-
-          ls -lh "$RUNNER_TEMP"/*USB.zip
-          ls -lh "$RUNNER_TEMP"/*source.zip
-
-      # =========================================================
-      # 17. UPLOAD FINAL ARTIFACTS
-      # =========================================================
-
-      - name: Upload build artifacts
+      - name: Upload verified build artifacts
         uses: actions/upload-artifact@v7
         with:
           name: x360-web-total-linux-${{ github.sha }}
@@ -1197,101 +1006,70 @@ jobs:
           retention-days: 30
           compression-level: 0
 
-      # =========================================================
-      # 18. FAILURE DIAGNOSTICS
-      # =========================================================
-
-      - name: Collect diagnostics
+      - name: Upload complete Buildroot diagnostics on failure
         if: failure()
         shell: bash
         run: |
           set -Eeuo pipefail
-
           DIAG="$RUNNER_TEMP/xwt-diagnostics"
           mkdir -p "$DIAG"
-
           for source in \
             "$RUNNER_TEMP/buildroot-output/.config" \
+            "$RUNNER_TEMP/buildroot-configure.log" \
+            "$RUNNER_TEMP/buildroot-build.log" \
             "$RUNNER_TEMP/free60-commit.txt" \
-            "$RUNNER_TEMP/buildroot-commit.txt"
-          do
+            "$RUNNER_TEMP/buildroot-commit.txt"; do
             if [ -f "$source" ]; then
-              cp "$source" "$DIAG/"
+              cp "$source" "$DIAG/$(basename "$source" | sed 's/^\.config$/buildroot-dot-config.txt/')"
             fi
           done
+          if [ -f "$RUNNER_TEMP/buildroot-output/.config" ]; then
+            grep -E '^(BR2_(powerpc|TOOLCHAIN|PACKAGE_NETSURF|PACKAGE_LIBCURL|PACKAGE_OPENSSL|PACKAGE_CA_CERTIFICATES|LINUX_KERNEL|TARGET_ROOTFS_CPIO))=|^# BR2_TOOLCHAIN' \
+              "$RUNNER_TEMP/buildroot-output/.config" > "$DIAG/buildroot-key-options.txt" || true
+          fi
+          if [ -d "$RUNNER_TEMP/buildroot-output/build/buildroot-config" ]; then
+            cp -a "$RUNNER_TEMP/buildroot-output/build/buildroot-config" "$DIAG/kconfig-host" || true
+          fi
+          printf 'Run: %s\nCommit: %s\n' "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$DIAG/run-info.txt"
 
-          df -h > "$DIAG/disk-space.txt"
-          df -i > "$DIAG/inode-space.txt"
-
-          ccache --show-stats > "$DIAG/ccache-stats.txt" || true
-
-          printf 'Run: %s\nCommit: %s\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_SHA" \
-            > "$DIAG/run-info.txt"
-
-      - name: Upload diagnostics
+      - name: Upload diagnostic artifact
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: xwt-linux-diagnostics-${{ github.run_id }}
+          name: xwt-0.13.0-build-diagnostics-${{ github.run_id }}
           path: ${{ runner.temp }}/xwt-diagnostics/
           if-no-files-found: warn
-          retention-days: 7
-          compression-level: 0
-
-      # =========================================================
-      # 19. BUILD SUMMARY
-      # =========================================================
+          retention-days: 14
+          compression-level: 6
 
       - name: Build summary
         if: always()
         shell: bash
         run: |
           {
-            echo "## X360 Web Total Linux"
-            echo ""
-            echo "Version: $XWT_VERSION"
-            echo "Revision: $XWT_REVISION"
+            echo '## X360 Web Total 0.13.0 — Xenon Linux build'
             echo "Commit: $GITHUB_SHA"
             echo "Buildroot: $BUILDROOT_COMMIT"
             echo "Free60: $FREE60_COMMIT"
-            echo "Target: Xbox 360 Xenon"
-            echo "Browser: NetSurf SDL framebuffer"
-            echo "HTTPS: libcurl + OpenSSL"
-            echo "Boot: XeLL Reloaded / USB"
-            echo "NAND writes: none"
-            echo ""
-            echo "Physical console testing is still required."
-            echo ""
-            echo "### Final disk state"
-            df -h
+            echo 'Target: Xbox 360 Xenon / PowerPC64 big-endian.'
+            echo 'Desktop: native SDL 1.2 + SDL_ttf framebuffer interface.'
+            echo 'Browser: NetSurf SDL/framebuffer; not Chromium.'
+            echo 'HTTPS: libcurl + OpenSSL + CA certificates.'
+            echo 'Network: SIS190 Ethernet; Wi-Fi only through a compatible USB adapter.'
+            echo 'Boot: XeLL Reloaded kboot.conf from USB. No NAND write operations.'
+            echo 'Physical Xbox 360 testing is still required.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # =============================================================
-  # 20. PUBLISH RELEASE
-  # =============================================================
-
   publish-release:
-    name: Publish Linux prerelease
+    name: Publish prerelease (trusted branch only)
     needs: build-linux
-
-    if: >-
-      ${{
-        github.event_name != 'pull_request' &&
-        (github.ref == 'refs/heads/main' ||
-         github.ref == 'refs/heads/master')
-      }}
-
+    if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
     runs-on: ubuntu-24.04
-
     permissions:
       contents: write
 
-    env:
-      XWT_VERSION: "0.13.0"
-
     steps:
-      - name: Download build artifacts
+      - name: Download verified build artifacts
         uses: actions/download-artifact@v7
         with:
           name: x360-web-total-linux-${{ github.sha }}
@@ -1303,54 +1081,35 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           cd "$RUNNER_TEMP/release-assets"
-
           TAG="xwt-v${XWT_VERSION}-linux-${GITHUB_SHA:0:12}"
-          TITLE="X360 Web Total ${XWT_VERSION} - Xenon Linux"
-
+          TITLE="X360 Web Total ${XWT_VERSION} — Xenon Linux (${GITHUB_SHA:0:12})"
           NOTES="$RUNNER_TEMP/release-notes.md"
-
           cat > "$NOTES" <<EOF
-          # X360 Web Total ${XWT_VERSION} - Xenon Linux
+          # X360 Web Total ${XWT_VERSION} — Xenon Linux
 
-          - Linux 7.2 with Xenon support.
-          - Native SDL framebuffer desktop.
-          - NetSurf SDL browser.
-          - libcurl and OpenSSL.
-          - Ethernet SIS190.
-          - USB Wi-Fi depends on adapter compatibility.
-          - XeLL Reloaded USB boot.
-          - No NAND write operations.
+          - Linux 7.2 com suporte Xenon/Xenos do projeto Free60.
+          - Desktop SDL 1.2/SDL_ttf em framebuffer, com explorador, painel de sistema e terminal.
+          - NetSurf SDL, libcurl/OpenSSL e certificados CA.
+          - Ethernet SIS190; Wi-Fi somente com adaptador USB compatível.
+          - Inicialização por XeLL Reloaded e kboot.conf no USB.
+          - Nenhuma gravação na NAND é executada pelo pacote.
 
-          NetSurf is not Chromium. Modern YouTube playback is not certified.
-          Physical Xbox 360 testing is required.
+          **Limitações:** NetSurf não é Chromium. YouTube moderno e reprodução atual de vídeo web não foram certificados. Compatibilidade de Wi-Fi varia por chipset. O artefato ainda precisa ser testado em um Xbox 360 físico.
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
-              ./*-USB.zip \
-              ./*-source.zip \
-              latest.json \
-              BUILD-REPORT.txt \
-              SHA256SUMS.txt \
+              ./*-USB.zip ./*-source.zip latest.json BUILD-REPORT.txt SHA256SUMS.txt \
               --clobber
-
-            gh release edit "$TAG" \
-              --title "$TITLE" \
-              --notes-file "$NOTES" \
-              --prerelease
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES" --prerelease
           else
             gh release create "$TAG" \
-              ./*-USB.zip \
-              ./*-source.zip \
-              latest.json \
-              BUILD-REPORT.txt \
-              SHA256SUMS.txt \
+              ./*-USB.zip ./*-source.zip latest.json BUILD-REPORT.txt SHA256SUMS.txt \
               --target "$GITHUB_SHA" \
               --title "$TITLE" \
               --notes-file "$NOTES" \
               --prerelease
           fi
-
-          echo "Release published: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" \
+            >> "$GITHUB_STEP_SUMMARY"
