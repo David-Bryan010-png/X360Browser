@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -67,7 +67,7 @@ jobs:
 
       - name: Restore Buildroot downloads and compiler cache
         id: build-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cache/xwt-buildroot-dl
@@ -95,7 +95,7 @@ jobs:
             exit 1
           }
           python3 - XWT-Linux-source.zip "$RUNNER_TEMP/xwt-project" <<'PY'
-          import shutil, stat, sys, zipfile
+          import hashlib, re, shutil, stat, sys, zipfile
           from pathlib import Path, PurePosixPath
           archive, destination = Path(sys.argv[1]), Path(sys.argv[2])
           required = (
@@ -115,6 +115,7 @@ jobs:
               "scripts/package_xwpkg.py", "scripts/test_xwpkg.py",
               "scripts/test_nand_boundary.py", "scripts/test_linux_network.py",
               "scripts/test_minimal_core.py", "scripts/test_updater_runtime.py",
+              "SOURCE-MANIFEST.sha256",
               "updates/system/opt/xwt/modules/system/bin/xwt-status",
               "README-INSTALL-PT-BR.txt",
           )
@@ -149,7 +150,24 @@ jobs:
               raise SystemExit("Versao da fonte incorreta")
           if (destination / "REVISION.txt").read_text().strip() != "xwt-linux-minimal-core-incremental":
               raise SystemExit("Revisao da fonte incorreta")
-          print("Fonte minimal-core validada:", destination)
+          manifest = destination / "SOURCE-MANIFEST.sha256"
+          expected = {}
+          for line in manifest.read_text(encoding="ascii").splitlines():
+              match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+              if not match:
+                  raise SystemExit("Linha invalida no SOURCE-MANIFEST.sha256")
+              digest, name = match.groups()
+              if name in expected:
+                  raise SystemExit("Caminho duplicado no SOURCE-MANIFEST.sha256: " + name)
+              expected[name] = digest
+          actual_files = {f.relative_to(destination).as_posix() for f in destination.rglob("*")
+                          if f.is_file() and f.name != "SOURCE-MANIFEST.sha256"}
+          if actual_files != set(expected):
+              raise SystemExit("SOURCE-MANIFEST nao cobre exatamente os arquivos da fonte")
+          for name, digest in expected.items():
+              if hashlib.sha256((destination / name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit("SHA-256 divergente na fonte: " + name)
+          print(f"Fonte minimal-core validada: {len(expected)} arquivos com SHA-256")
           PY
           echo "PROJECT_DIR=$RUNNER_TEMP/xwt-project" >> "$GITHUB_ENV"
 
@@ -172,7 +190,17 @@ jobs:
           test "$(git -C "$FREE60_DIR" rev-parse HEAD)" = "$FREE60_COMMIT"
           test -s "$FREE60_DIR/xenon-7.2.defconfig"
           test -s "$FREE60_DIR/patch-7.2-xenon0.30.diff"
+          python3 - "$FREE60_DIR/patch-7.2-xenon0.30.diff" <<'PY'
+          import sys
+          from pathlib import Path
+          patch = Path(sys.argv[1]).read_text(errors="replace")
+          required = ("config PPC_XENON", "depends on PPC64", "default y", "image-$(CONFIG_PPC_XENON) += zImage.xenon")
+          missing = [token for token in required if token not in patch]
+          if missing:
+              raise SystemExit("Free60 patch does not define the expected Xenon platform/wrapper: " + ", ".join(missing))
+          PY
           cp "$FREE60_DIR/xenon-7.2.defconfig" "$PROJECT_DIR/linux/xenon-7.2.defconfig"
+          printf '%s\n' "$FREE60_COMMIT" > "$PROJECT_DIR/linux/FREE60-KERNEL-COMMIT.txt"
           python3 - "$PROJECT_DIR/linux/xenon-7.2.defconfig" <<'PY'
           import re, sys
           from pathlib import Path
@@ -195,8 +223,11 @@ jobs:
           lines.extend(f"{key}={value}" for key,value in options.items())
           path.write_text("\n".join(lines)+"\n")
           PY
-          for required in '^CONFIG_PPC_XENON=y$' '^CONFIG_PPC64=y$' '^CONFIG_BLK_DEV_INITRD=y$' '^CONFIG_RD_GZIP=y$' '^CONFIG_DRM_XENOS=y$' '^CONFIG_SIS190=y$' '^CONFIG_USB_STORAGE=y$' '^CONFIG_JOYSTICK_XPAD=m$' '^CONFIG_INPUT_JOYDEV=m$' '^CONFIG_INPUT_UINPUT=m$'; do
-            grep -q "$required" "$PROJECT_DIR/linux/xenon-7.2.defconfig" || { echo "Kernel option missing: $required" >&2; exit 1; }
+          # CONFIG_PPC_XENON is intentionally NOT expected in this raw defconfig.
+          # Free60's patch adds the Kconfig symbol (depends on PPC64, default y).
+          # Its final value is checked after Linux Kconfig runs in the preflight step.
+          for required in '^CONFIG_PPC64=y$' '^CONFIG_BLK_DEV_INITRD=y$' '^CONFIG_RD_GZIP=y$' '^CONFIG_DRM_XENOS=y$' '^CONFIG_SIS190=y$' '^CONFIG_USB_STORAGE=y$' '^CONFIG_JOYSTICK_XPAD=m$' '^CONFIG_INPUT_JOYDEV=m$' '^CONFIG_INPUT_UINPUT=m$'; do
+            grep -q "$required" "$PROJECT_DIR/linux/xenon-7.2.defconfig" || { echo "Free60 defconfig option missing: $required" >&2; exit 1; }
           done
           git -C "$FREE60_DIR" rev-parse HEAD > "$RUNNER_TEMP/free60-commit.txt"
 
@@ -284,6 +315,21 @@ jobs:
           p.write_text(s.replace(old,"\t# XWT: keep Xenon boot image in images/, outside the PPC64 rootfs.\n",1))
           PY
 
+      - name: Preflight Xenon Linux Kconfig before full compilation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          OUTPUT="$RUNNER_TEMP/buildroot-output"
+          # Buildroot's linux-configure target downloads, patches and configures
+          # Linux, but does not compile the kernel or the complete root filesystem.
+          make -C "$BUILDROOT_DIR" O="$OUTPUT" linux-configure 2>&1 | tee "$RUNNER_TEMP/linux-configure.log"
+          KERNEL_CONFIG="$(find "$OUTPUT/build" -maxdepth 4 -type f -path '*/linux-*/.config' -print -quit)"
+          test -s "$KERNEL_CONFIG" || { echo 'Linux Kconfig did not produce .config' >&2; exit 1; }
+          for required in '^CONFIG_PPC_XENON=y$' '^CONFIG_PPC64=y$' '^CONFIG_BLK_DEV_INITRD=y$' '^CONFIG_RD_GZIP=y$' '^CONFIG_DRM_XENOS=y$' '^CONFIG_DRM_FBDEV_EMULATION=y$' '^CONFIG_FRAMEBUFFER_CONSOLE=y$' '^CONFIG_SIS190=y$' '^CONFIG_USB_STORAGE=y$' '^CONFIG_JOYSTICK_XPAD=m$' '^CONFIG_INPUT_JOYDEV=m$' '^CONFIG_INPUT_UINPUT=m$'; do
+            grep -q "$required" "$KERNEL_CONFIG" || { echo "Generated Linux Kconfig missing: $required" >&2; sed -n '/PPC_XENON/p;/PPC64/p' "$KERNEL_CONFIG" >&2 || true; exit 1; }
+          done
+          echo "Kconfig preflight passed; full kernel/rootfs compilation may begin."
+
       - name: Build kernel and minimal root filesystem
         shell: bash
         run: |
@@ -324,10 +370,11 @@ jobs:
               mode,size,nsize=v[1],v[6],v[11]
               raw=f.read(nsize)
               if len(raw)!=nsize or not raw.endswith(b'\0'): raise SystemExit('Invalid CPIO name')
-              name=raw[:-1].decode('utf-8','replace').lstrip('./')
+              name=raw[:-1].decode('utf-8','strict')
+              while name.startswith('./'): name=name[2:]
               if name=='TRAILER!!!': break
               path=PurePosixPath(name)
-              if path.is_absolute() or '..' in path.parts: raise SystemExit('Unsafe CPIO path: '+name)
+              if path.is_absolute() or '..' in path.parts or '\\' in name: raise SystemExit('Unsafe CPIO path: '+name)
               f.seek(align(110+nsize)-(110+nsize),1)
               names.add(name)
               if mode & 0o111: executable.add(name)
@@ -341,67 +388,21 @@ jobs:
           PY
           ccache --show-stats || true
 
-      - name: Validate and prepare the actual Xenon ELF kernel
+      - name: Validate the XeLL-compatible Xenon boot wrapper
         shell: bash
         run: |
           set -Eeuo pipefail
-          OUTPUT="$RUNNER_TEMP/buildroot-output"
-          # zImage.xenon is a boot image, not an ELF. Never rename it to .elf.
-          mapfile -t CANDIDATES < <(find "$OUTPUT/build" -type f -path '*/linux-*/vmlinux' -size +1M -print)
-          if [ "${#CANDIDATES[@]}" -ne 1 ]; then
-            echo "Expected exactly one built Linux vmlinux ELF; found ${#CANDIDATES[@]}" >&2
-            find "$OUTPUT" -type f \( -name 'vmlinux' -o -name 'zImage*' \) -printf '%p (%s bytes)\n' >&2 || true
-            exit 1
-          fi
-          KERNEL_ELF="${CANDIDATES[0]}"
-          python3 - "$KERNEL_ELF" "$PROJECT_DIR/scripts/package_linux_usb.py" <<'PY'
-          import struct, sys
+          KERNEL="$RUNNER_TEMP/buildroot-output/images/zImage.xenon"
+          test -s "$KERNEL" || { echo 'Buildroot did not create images/zImage.xenon' >&2; exit 1; }
+          file "$KERNEL"
+          PYTHONPATH="$PROJECT_DIR/scripts" python3 - "$KERNEL" <<'PY'
+          import sys
           from pathlib import Path
-          kernel=Path(sys.argv[1]); script=Path(sys.argv[2]); data=kernel.read_bytes()
-          if len(data) < 64 or data[:7] != b'\x7fELF\x02\x02\x01':
-              raise SystemExit('Built vmlinux is not a 64-bit big-endian ELF; refusing to package zImage under an .elf name.')
-          e_type, machine=struct.unpack('>HH',data[16:20])
-          version=struct.unpack('>I',data[20:24])[0]
-          entry=struct.unpack('>Q',data[24:32])[0]
-          if e_type not in (2,3) or machine != 21 or version != 1 or entry == 0:
-              raise SystemExit(f'Invalid Xenon PPC64 ELF header: type={e_type}, machine={machine}, version={version}, entry={entry:#x}')
-          text=script.read_text()
-          start=text.index('def validate_kernel(path: Path) -> None:')
-          end=text.index('\n\n\ndef validate_kboot',start)
-          replacement="""def validate_kernel(path: Path) -> None:
-              validate_kernel_bytes(path.read_bytes())
-          """
-          text=text[:start]+replacement+text[end:]
-          start=text.index('def validate_kernel_bytes(data: bytes) -> None:')
-          end=text.index('\n\n\ndef main()',start)
-          replacement="""def validate_kernel_bytes(data: bytes) -> None:
-              # Xenon Linux is PPC64 big-endian; PPC32 remains accepted for legacy test fixtures.
-              if len(data) < 52 or data[:4] != b"\\x7fELF" or data[5:7] != b"\\x02\\x01":
-                  raise ValueError("packaged kernel is not a big-endian ELF executable")
-              elf_class=data[4]
-              if elf_class == 1:
-                  if len(data) < 52: raise ValueError("truncated ELF32 kernel")
-                  e_type, machine = struct.unpack(">HH", data[16:20])
-                  version = struct.unpack(">I", data[20:24])[0]
-                  entry = struct.unpack(">I", data[24:28])[0]
-                  valid_machine = machine == 20
-              elif elf_class == 2:
-                  if len(data) < 64: raise ValueError("truncated ELF64 kernel")
-                  e_type, machine = struct.unpack(">HH", data[16:20])
-                  version = struct.unpack(">I", data[20:24])[0]
-                  entry = struct.unpack(">Q", data[24:32])[0]
-                  valid_machine = machine == 21
-              else:
-                  raise ValueError("unsupported ELF class")
-              if e_type not in (2, 3) or not valid_machine or version != 1 or entry == 0:
-                  raise ValueError("kernel ELF header is not an executable PowerPC ELF")
-          """
-          text=text[:start]+replacement+text[end:]
-          script.write_text(text)
-          print(f'Validated PPC64 Xenon ELF: {kernel} ({len(data)} bytes, entry={entry:#x})')
+          import package_linux_usb
+          path = Path(sys.argv[1])
+          package_linux_usb.validate_kernel(path)
+          print(f"XeLL ELF32/PPC wrapper validated: {path} ({path.stat().st_size} bytes)")
           PY
-          cp "$KERNEL_ELF" "$RUNNER_TEMP/xwt-linux.elf"
-          echo "KERNEL_ELF=$RUNNER_TEMP/xwt-linux.elf" >> "$GITHUB_ENV"
 
       - name: Save cross-toolchain cache for future native modules
         if: success()
@@ -417,14 +418,14 @@ jobs:
 
       - name: Persist cross-toolchain cache
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ~/.cache/xwt-cross-toolchain
           key: ${{ runner.os }}-xwt-cross-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-minimal-core-v1
 
       - name: Save Buildroot caches
         if: ${{ always() && steps.build-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             ~/.cache/xwt-buildroot-dl
@@ -459,20 +460,24 @@ jobs:
           python3 "$PROJECT_DIR/scripts/package_linux_usb.py" \
             --launcher "$RUNNER_TEMP/default.xex" \
             --launcher-license "$RUNNER_TEMP/XellLaunch2-LICENSE.txt" \
-            --kernel "$KERNEL_ELF" \
+            --kernel "$RUNNER_TEMP/buildroot-output/images/zImage.xenon" \
             --initrd "$RUNNER_TEMP/buildroot-output/images/rootfs.cpio.gz" \
             --project "$PROJECT_DIR" \
             --output "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-USB.zip"
           sha256sum "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-USB.zip" > "$RUNNER_TEMP/USB-SHA256.txt"
           python3 - "$PROJECT_DIR" "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-source.zip" <<'PY'
-          import sys, zipfile
+          import hashlib, sys, zipfile
           from pathlib import Path
           root=Path(sys.argv[1]); output=Path(sys.argv[2])
+          files=[p for p in sorted(root.rglob('*')) if p.is_file()
+                 and '.git' not in p.parts and '__pycache__' not in p.parts
+                 and p.suffix not in {'.pyc','.pyo'} and p.name!='SOURCE-MANIFEST.sha256']
+          manifest=''.join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(root).as_posix()}\n" for p in files)
+          (root/'SOURCE-MANIFEST.sha256').write_text(manifest,encoding='ascii')
           with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
-              for path in sorted(root.rglob('*')):
-                  if path.is_file() and '.git' not in path.parts:
-                      z.write(path,path.relative_to(root).as_posix())
-          print('Source archive rebuilt from the exact patched build tree:',output)
+              for path in files+[root/'SOURCE-MANIFEST.sha256']:
+                  z.write(path,path.relative_to(root).as_posix())
+          print(f'Source archive rebuilt with a fresh SHA-256 manifest ({len(files)} files):',output)
           PY
           SYSTEM_VERSION="${XWT_VERSION}+${GITHUB_SHA:0:12}"
           python3 "$PROJECT_DIR/scripts/package_xwpkg.py" \
@@ -491,14 +496,14 @@ jobs:
           data={"schema":1,"product":"XWT Linux","version":version,"revision":revision,
                 "release_tag":"xwt-linux-dev","base":{"usb_package":core_url},
                 "components":{"system":{"version":system_version,"sha256":digest,"package":module_url}},
-                "boot":{"chain":"default.xex -> XellLaunch2 -> XeLL Reloaded -> Xenon ELF + initramfs",
+                "boot":{"chain":"default.xex -> XellLaunch2 -> XeLL Reloaded -> ELF32 zImage.xenon wrapper (PPC64 kernel) + initramfs",
                 "physical_console_tested":False,"nand_write":False}}
           Path(metadata).write_text(json.dumps(data,indent=2)+'\n')
           PY
           printf 'XWT Linux %s\nMinimal core build\nCommit: %s\nBuildroot: %s\nFree60: %s\n' "$XWT_VERSION" "$GITHUB_SHA" "$BUILDROOT_COMMIT" "$FREE60_COMMIT" > "$RUNNER_TEMP/BUILD-REPORT.txt"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xwt-linux-core-${{ github.sha }}
           path: |
@@ -516,12 +521,13 @@ jobs:
 
       - name: Upload diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xwt-linux-core-diagnostics-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/buildroot-output/.config
             ${{ runner.temp }}/buildroot-configure.log
+            ${{ runner.temp }}/linux-configure.log
             ${{ runner.temp }}/buildroot-build.log
             ${{ runner.temp }}/free60-commit.txt
             ${{ runner.temp }}/buildroot-commit.txt
@@ -535,7 +541,7 @@ jobs:
             echo '## XWT Linux 0.14.0-alpha.2 — Minimal Core'
             echo 'First build compiles the Xenon kernel and minimum userspace once.'
             echo 'Desktop, browser, audio, Wi-Fi and graphics enhancements are deferred to small .xwpkg modules.'
-            echo 'Boot: default.xex -> XellLaunch2 -> XeLL Reloaded -> Xenon ELF + initramfs.'
+            echo 'Boot: default.xex -> XellLaunch2 -> XeLL Reloaded -> ELF32 zImage.xenon wrapper + PPC64 kernel + initramfs.'
             echo 'NAND writes: none. Physical Xbox 360 test: not yet performed.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -547,7 +553,7 @@ jobs:
       contents: write
     steps:
       - name: Download build assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: xwt-linux-core-${{ github.sha }}
           path: ${{ runner.temp }}/release-assets
@@ -573,7 +579,7 @@ jobs:
 
           Desktop gráfico, navegador, áudio, Wi-Fi e melhorias adicionais serão distribuídos depois como módulos incrementais `.xwpkg`, sem recompilar o kernel.
 
-          Boot: `default.xex` -> XellLaunch2 -> XeLL Reloaded -> kernel ELF + initramfs.
+          Boot: `default.xex` -> XellLaunch2 -> XeLL Reloaded -> ELF32 `zImage.xenon` wrapper (containing the PPC64 kernel) + initramfs.
 
           Ainda requer teste físico no Xbox 360. O pacote não grava NAND, KV, SMC ou firmware.
           EOF_NOTES
