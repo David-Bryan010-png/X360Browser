@@ -20,6 +20,8 @@ env:
   FREE60_COMMIT: 3c3e76fb1ffa3bcce3a50a6af6b847a2da25139f
   XWT_VERSION: "0.13.0"
   XWT_REVISION: linux-xenon-desktop-shell
+  CCACHE_DIR: /home/runner/.cache/xwt-buildroot-ccache
+  CCACHE_MAXSIZE: 512M
 
 jobs:
   build-linux:
@@ -28,16 +30,72 @@ jobs:
     timeout-minutes: 300
 
     steps:
+      # =========================================================
+      # 1. FREE DISK SPACE BEFORE ANY HEAVY OPERATION
+      # =========================================================
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== INITIAL DISK ==="
+          df -h
+          df -i
+
+          echo "Removing unnecessary preinstalled SDKs..."
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/lib/node_modules
+
+          if command -v docker >/dev/null 2>&1; then
+            docker system prune -af --volumes || true
+          fi
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /var/cache/apt/archives/*
+
+          echo "=== AVAILABLE DISK ==="
+          df -h
+
+          AVAILABLE=$(df -Pk /home/runner | awk 'NR==2 {print $4}')
+
+          if [ "$AVAILABLE" -lt 5242880 ]; then
+            echo "ERROR: Less than 5 GB available after cleanup."
+            exit 1
+          fi
+
+      # =========================================================
+      # 2. CHECKOUT
+      # =========================================================
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          clean: true
+          fetch-depth: 1
+
+      # =========================================================
+      # 3. INSTALL DEPENDENCIES
+      # =========================================================
 
       - name: Install dependencies
         shell: bash
         run: |
           set -Eeuo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends \
             build-essential gcc g++ make bc bison flex gawk \
             ccache cpio file git curl wget patch rsync unzip zip \
@@ -46,19 +104,44 @@ jobs:
             libncurses-dev libssl-dev libelf-dev libffi-dev \
             zlib1g-dev zstd xz-utils
 
-      # A new key per commit allows GitHub to save updated cache contents.
-      # restore-keys recovers the newest compatible previous cache.
-      - name: Restore incremental caches
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "=== DISK AFTER DEPENDENCIES ==="
+          df -h
+
+          ccache --version
+
+      # =========================================================
+      # 4. INCREMENTAL CACHE
+      # =========================================================
+
+      - name: Restore compiler cache
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/xwt-buildroot-dl
-            ~/.cache/xwt-buildroot-ccache
-          key: ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-${{ github.sha }}
+          path: ~/.cache/xwt-buildroot-ccache
+          key: ${{ runner.os }}-xwt-ccache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-
-            ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-${{ env.BUILDROOT_COMMIT }}-
-            ${{ runner.os }}-xwt-${{ env.XWT_VERSION }}-
+            ${{ runner.os }}-xwt-ccache-${{ env.XWT_VERSION }}-${{ github.ref_name }}-
+            ${{ runner.os }}-xwt-ccache-${{ env.XWT_VERSION }}-
+
+      - name: Configure compiler cache
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$CCACHE_DIR"
+
+          ccache --set-config=max_size=512M
+          ccache --set-config=compression=true
+          ccache --zero-stats || true
+
+          echo "Compiler cache configured."
+          ccache --show-stats
+
+      # =========================================================
+      # 5. SOURCE VALIDATION
+      # =========================================================
 
       - name: Locate and validate project source
         shell: bash
@@ -117,6 +200,7 @@ jobs:
                   return False
 
           candidates = [workspace]
+
           candidates.extend(
               p for p in workspace.iterdir()
               if p.is_dir() and p.name not in {".git", ".github"}
@@ -126,8 +210,10 @@ jobs:
 
           if len(found) == 1:
               project = found[0]
+
           elif len(found) > 1:
               raise SystemExit("Multiple valid project source directories found.")
+
           else:
               archives = []
 
@@ -169,7 +255,13 @@ jobs:
                                   == "linux-xenon-desktop-shell"
                               ):
                                   archives.append((archive, prefix, infos))
-                  except (OSError, zipfile.BadZipFile, KeyError, UnicodeError):
+
+                  except (
+                      OSError,
+                      zipfile.BadZipFile,
+                      KeyError,
+                      UnicodeError
+                  ):
                       continue
 
               if len(archives) != 1:
@@ -178,6 +270,7 @@ jobs:
                   )
 
               archive, prefix, infos = archives[0]
+
               shutil.rmtree(extraction, ignore_errors=True)
               extraction.mkdir(parents=True)
 
@@ -200,26 +293,33 @@ jobs:
 
                       total += info.file_size
 
-                      if info.file_size > 128 * 1024 * 1024 or total > 768 * 1024 * 1024:
+                      if (
+                          info.file_size > 128 * 1024 * 1024
+                          or total > 768 * 1024 * 1024
+                      ):
                           raise SystemExit("Source ZIP exceeds safety limit.")
 
                       if info.is_dir():
                           continue
 
                       destination = extraction.joinpath(*item.parts)
-                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      destination.parent.mkdir(
+                          parents=True,
+                          exist_ok=True
+                      )
 
-                      with zf.open(info) as source, destination.open("wb") as target:
-                          shutil.copyfileobj(source, target)
+                      with zf.open(info) as source:
+                          with destination.open("wb") as target:
+                              shutil.copyfileobj(source, target)
 
-                      destination.chmod(0o755 if mode & 0o111 else 0o644)
+                      destination.chmod(
+                          0o755 if mode & 0o111 else 0o644
+                      )
 
               project = extraction / prefix if prefix else extraction
 
               if not valid(project):
                   raise SystemExit("Extracted source is invalid.")
-
-          os.environ.get("GITHUB_WORKSPACE")
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"PROJECT_DIR={project}\n")
@@ -232,6 +332,10 @@ jobs:
           print("Validated project:", project)
           PY
 
+      # =========================================================
+      # 6. SOURCE INTEGRITY
+      # =========================================================
+
       - name: Verify source integrity
         shell: bash
         run: |
@@ -241,6 +345,10 @@ jobs:
           if [ -f SOURCE-MANIFEST.sha256 ]; then
             sha256sum --check SOURCE-MANIFEST.sha256
           fi
+
+      # =========================================================
+      # 7. TESTS
+      # =========================================================
 
       - name: Run shell and Python tests
         shell: bash
@@ -273,13 +381,19 @@ jobs:
             linux/overlay/usr/sbin/xwt-time-sync.py
 
           cd scripts
+
           python3 -m unittest -v \
             test_package_linux_usb \
             test_linux_network \
             test_desktop
 
           cd ..
+
           python3 scripts/test_nand_boundary.py
+
+      # =========================================================
+      # 8. HOST REGRESSION TESTS
+      # =========================================================
 
       - name: Build host regression tests
         shell: bash
@@ -298,6 +412,12 @@ jobs:
             --output-on-failure \
             --no-tests=error
 
+          rm -rf "$RUNNER_TEMP/xwt-host-regression"
+
+      # =========================================================
+      # 9. FETCH FREE60
+      # =========================================================
+
       - name: Fetch Free60 Xenon support
         shell: bash
         run: |
@@ -306,6 +426,7 @@ jobs:
           DIR="$RUNNER_TEMP/free60-xenon"
 
           git init "$DIR"
+
           git -C "$DIR" remote add origin \
             https://github.com/Free60Project/linux-kernel-xbox360.git
 
@@ -368,6 +489,7 @@ jobs:
                   lines.append(line)
 
           lines.extend(f"{k}={v}" for k, v in options.items())
+
           path.write_text("\n".join(lines) + "\n")
           PY
 
@@ -387,6 +509,10 @@ jobs:
           git -C "$DIR" rev-parse HEAD \
             > "$RUNNER_TEMP/free60-commit.txt"
 
+      # =========================================================
+      # 10. FETCH BUILDROOT
+      # =========================================================
+
       - name: Fetch Buildroot
         shell: bash
         run: |
@@ -395,6 +521,7 @@ jobs:
           DIR="$RUNNER_TEMP/buildroot"
 
           git init "$DIR"
+
           git -C "$DIR" remote add origin \
             https://github.com/buildroot/buildroot.git
 
@@ -406,6 +533,12 @@ jobs:
           git -C "$DIR" rev-parse HEAD \
             > "$RUNNER_TEMP/buildroot-commit.txt"
 
+          df -h
+
+      # =========================================================
+      # 11. CONFIGURE BUILDROOT
+      # =========================================================
+
       - name: Configure Buildroot
         shell: bash
         run: |
@@ -414,7 +547,7 @@ jobs:
           export BR2_DL_DIR="$HOME/.cache/xwt-buildroot-dl"
 
           mkdir -p "$BR2_DL_DIR"
-          mkdir -p "$HOME/.cache/xwt-buildroot-ccache"
+          mkdir -p "$CCACHE_DIR"
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           mkdir -p "$OUTPUT"
@@ -452,6 +585,7 @@ jobs:
                   if not line.startswith(symbol + "=")
                   and line != f"# {symbol} is not set"
               ]
+
               lines.append(f"{symbol}={value}")
 
           config.write_text("\n".join(lines) + "\n")
@@ -459,7 +593,7 @@ jobs:
 
           make -C "$RUNNER_TEMP/buildroot" \
             O="$OUTPUT" olddefconfig \
-            2>&1 | tee "$RUNNER_TEMP/buildroot-configure.log"
+            2>&1 | tail -n 150
 
           CONFIG="$OUTPUT/.config"
 
@@ -515,6 +649,20 @@ jobs:
 
           grep -Fq "$PROJECT_DIR/linux/post-build.sh" "$CONFIG"
 
+          echo "=== DISK BEFORE BUILD ==="
+          df -h
+
+          AVAILABLE=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+
+          if [ "$AVAILABLE" -lt 8388608 ]; then
+            echo "ERROR: Less than 8 GB available before compilation."
+            exit 1
+          fi
+
+      # =========================================================
+      # 12. COMPILE
+      # =========================================================
+
       - name: Compile Linux kernel and root filesystem
         shell: bash
         run: |
@@ -522,18 +670,25 @@ jobs:
 
           export BR2_DL_DIR="$HOME/.cache/xwt-buildroot-dl"
 
-          ccache --max-size=5G || true
-          ccache --zero-stats || true
+          ccache --max-size=512M || true
 
-          JOBS="$(nproc)"
-          if [ "$JOBS" -gt 4 ]; then JOBS=4; fi
+          JOBS=2
 
           echo "Buildroot workers: $JOBS"
+          echo "Compiler cache: 512 MB"
 
-          make -C "$RUNNER_TEMP/buildroot" \
+          echo "=== DISK BEFORE COMPILATION ==="
+          df -h
+
+          if ! make -C "$RUNNER_TEMP/buildroot" \
             O="$RUNNER_TEMP/buildroot-output" \
             -j"$JOBS" \
-            2>&1 | tee "$RUNNER_TEMP/buildroot-build.log"
+            2>&1 | tail -n 250
+          then
+            echo "BUILDROOT COMPILATION FAILED"
+            df -h
+            exit 1
+          fi
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           TARGET="$OUTPUT/target"
@@ -582,7 +737,14 @@ jobs:
               -print -quit | grep -q .
           done
 
-          ccache --show-stats || true
+          ccache --show-stats
+
+          echo "=== DISK AFTER COMPILATION ==="
+          df -h
+
+      # =========================================================
+      # 13. CREATE USB PACKAGE
+      # =========================================================
 
       - name: Create verified USB package
         shell: bash
@@ -597,6 +759,12 @@ jobs:
 
           sha256sum "$RUNNER_TEMP/$XWT_ASSET_PREFIX-USB.zip" \
             > "$RUNNER_TEMP/USB-SHA256.txt"
+
+          test -s "$RUNNER_TEMP/$XWT_ASSET_PREFIX-USB.zip"
+
+      # =========================================================
+      # 14. SOURCE ARCHIVE
+      # =========================================================
 
       - name: Create source archive
         shell: bash
@@ -614,16 +782,28 @@ jobs:
           output = Path(sys.argv[2])
 
           ignored_dirs = {
-              ".git", "__pycache__", ".pytest_cache",
-              "build", "output", "CMakeFiles"
+              ".git",
+              "__pycache__",
+              ".pytest_cache",
+              "build",
+              "output",
+              "CMakeFiles"
           }
 
           ignored_suffixes = {
-              ".o", ".a", ".so", ".elf", ".pyc", ".zip"
+              ".o",
+              ".a",
+              ".so",
+              ".elf",
+              ".pyc",
+              ".zip"
           }
 
           with zipfile.ZipFile(
-              output, "w", zipfile.ZIP_DEFLATED, compresslevel=9
+              output,
+              "w",
+              zipfile.ZIP_DEFLATED,
+              compresslevel=6
           ) as archive:
 
               for path in sorted(root.rglob("*")):
@@ -642,13 +822,15 @@ jobs:
                       continue
 
                   info = zipfile.ZipInfo(
-                      relative.as_posix(), (2026, 1, 1, 0, 0, 0)
+                      relative.as_posix(),
+                      (2026, 1, 1, 0, 0, 0)
                   )
 
                   mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
                   info.external_attr = (stat.S_IFREG | mode) << 16
 
-                  archive.writestr(info, path.read_bytes())
+                  with path.open("rb") as source:
+                      archive.writestr(info, source.read())
 
           with zipfile.ZipFile(output) as archive:
               if archive.testzip():
@@ -656,6 +838,10 @@ jobs:
 
           print("Source archive created:", output)
           PY
+
+      # =========================================================
+      # 15. RELEASE MANIFEST
+      # =========================================================
 
       - name: Generate release manifest
         shell: bash
@@ -727,6 +913,36 @@ jobs:
           sha256sum latest.json BUILD-REPORT.txt \
             "$USB" "$SOURCE" > SHA256SUMS.txt
 
+      # =========================================================
+      # 16. REMOVE HEAVY BUILD FILES
+      # =========================================================
+
+      - name: Remove temporary build data
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Removing Buildroot temporary files..."
+
+          rm -rf \
+            "$RUNNER_TEMP/buildroot-output" \
+            "$RUNNER_TEMP/buildroot" \
+            "$RUNNER_TEMP/free60-xenon" \
+            "$RUNNER_TEMP/xwt-host-regression" \
+            "$HOME/.cache/xwt-buildroot-dl"
+
+          echo "Compiler cache will be preserved for saving."
+
+          echo "=== DISK BEFORE ARTIFACT UPLOAD ==="
+          df -h
+
+          ls -lh "$RUNNER_TEMP"/*USB.zip
+          ls -lh "$RUNNER_TEMP"/*source.zip
+
+      # =========================================================
+      # 17. UPLOAD FINAL ARTIFACTS
+      # =========================================================
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -744,6 +960,10 @@ jobs:
           retention-days: 30
           compression-level: 0
 
+      # =========================================================
+      # 18. FAILURE DIAGNOSTICS
+      # =========================================================
+
       - name: Collect diagnostics
         if: failure()
         shell: bash
@@ -755,8 +975,6 @@ jobs:
 
           for source in \
             "$RUNNER_TEMP/buildroot-output/.config" \
-            "$RUNNER_TEMP/buildroot-configure.log" \
-            "$RUNNER_TEMP/buildroot-build.log" \
             "$RUNNER_TEMP/free60-commit.txt" \
             "$RUNNER_TEMP/buildroot-commit.txt"
           do
@@ -765,8 +983,14 @@ jobs:
             fi
           done
 
+          df -h > "$DIAG/disk-space.txt"
+          df -i > "$DIAG/inode-space.txt"
+
+          ccache --show-stats > "$DIAG/ccache-stats.txt" || true
+
           printf 'Run: %s\nCommit: %s\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_SHA" > "$DIAG/run-info.txt"
+            "$GITHUB_RUN_ID" "$GITHUB_SHA" \
+            > "$DIAG/run-info.txt"
 
       - name: Upload diagnostics
         if: failure()
@@ -775,7 +999,12 @@ jobs:
           name: xwt-linux-diagnostics-${{ github.run_id }}
           path: ${{ runner.temp }}/xwt-diagnostics/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
+          compression-level: 0
+
+      # =========================================================
+      # 19. BUILD SUMMARY
+      # =========================================================
 
       - name: Build summary
         if: always()
@@ -783,7 +1012,9 @@ jobs:
         run: |
           {
             echo "## X360 Web Total Linux"
+            echo ""
             echo "Version: $XWT_VERSION"
+            echo "Revision: $XWT_REVISION"
             echo "Commit: $GITHUB_SHA"
             echo "Buildroot: $BUILDROOT_COMMIT"
             echo "Free60: $FREE60_COMMIT"
@@ -792,12 +1023,21 @@ jobs:
             echo "HTTPS: libcurl + OpenSSL"
             echo "Boot: XeLL Reloaded / USB"
             echo "NAND writes: none"
+            echo ""
             echo "Physical console testing is still required."
+            echo ""
+            echo "### Final disk state"
+            df -h
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # =============================================================
+  # 20. PUBLISH RELEASE
+  # =============================================================
 
   publish-release:
     name: Publish Linux prerelease
     needs: build-linux
+
     if: >-
       ${{
         github.event_name != 'pull_request' &&
@@ -806,6 +1046,7 @@ jobs:
       }}
 
     runs-on: ubuntu-24.04
+
     permissions:
       contents: write
 
