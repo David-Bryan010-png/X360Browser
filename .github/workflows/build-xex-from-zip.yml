@@ -299,6 +299,9 @@ jobs:
           lines.extend(f"{key}={value}" for key,value in options.items())
           path.write_text("\n".join(lines)+"\n")
           PY
+          # CONFIG_PPC_XENON is intentionally NOT expected in this raw defconfig.
+          # Free60's patch adds the Kconfig symbol (depends on PPC64, default y).
+          # Its final value is checked after Linux Kconfig runs in the preflight step.
           for required in '^CONFIG_PPC64=y$' '^CONFIG_BLK_DEV_INITRD=y$' '^CONFIG_RD_GZIP=y$' '^CONFIG_DRM_XENOS=y$' '^CONFIG_SIS190=y$' '^CONFIG_USB_STORAGE=y$' '^CONFIG_JOYSTICK_XPAD=m$' '^CONFIG_INPUT_KEYBOARD=y$' '^CONFIG_INPUT_JOYDEV=m$' '^CONFIG_INPUT_UINPUT=m$'; do
             grep -q "$required" "$PROJECT_DIR/linux/xenon-7.2.defconfig" || { echo "Free60 defconfig option missing: $required" >&2; exit 1; }
           done
@@ -401,13 +404,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           OUTPUT="$RUNNER_TEMP/buildroot-output"
+          # Buildroot's linux-configure target downloads, patches and configures
+          # Linux, but does not compile the kernel or the complete root filesystem.
           make -C "$BUILDROOT_DIR" O="$OUTPUT" linux-configure 2>&1 | tee "$RUNNER_TEMP/linux-configure.log"
           KERNEL_CONFIG="$(find "$OUTPUT/build" -maxdepth 4 -type f -path '*/linux-*/.config' -print -quit)"
           test -s "$KERNEL_CONFIG" || { echo 'Linux Kconfig did not produce .config' >&2; exit 1; }
           for required in '^CONFIG_PPC_XENON=y$' '^CONFIG_PPC64=y$' '^CONFIG_BLK_DEV_INITRD=y$' '^CONFIG_RD_GZIP=y$' '^CONFIG_DRM_XENOS=y$' '^CONFIG_DRM_FBDEV_EMULATION=y$' '^CONFIG_FRAMEBUFFER_CONSOLE=y$' '^CONFIG_SIS190=y$' '^CONFIG_USB_STORAGE=y$' '^CONFIG_JOYSTICK_XPAD=m$' '^CONFIG_INPUT_KEYBOARD=y$' '^CONFIG_INPUT_JOYDEV=m$' '^CONFIG_INPUT_UINPUT=m$'; do
             grep -q "$required" "$KERNEL_CONFIG" || { echo "Generated Linux Kconfig missing: $required" >&2; sed -n '/PPC_XENON/p;/PPC64/p' "$KERNEL_CONFIG" >&2 || true; exit 1; }
           done
-          echo "Kconfig preflight passed."
+          echo "Kconfig preflight passed; applying the guarded Xenos tiled-framebuffer correction."
 
       - name: Ensure Buildroot post-build script is executable
         shell: bash
@@ -418,209 +423,36 @@ jobs:
           chmod 0755 "$POST_BUILD"
           test -x "$POST_BUILD"
 
-      # ============================================================
-      # CORRIGIDO: aplica o patch, valida, REPARA o C se necessário
-      # e, em último caso, reverte para o original (build continua).
-      # ============================================================
       - name: Patch Xenos DRM tiled framebuffer safely
         shell: bash
         run: |
           set -Eeuo pipefail
-          OUTPUT="$RUNNER_TEMP/buildroot-output"
-          DRIVER="$(find "$OUTPUT/build" -maxdepth 6 -type f -path '*/drivers/gpu/drm/tiny/xenos.c' -print -quit)"
-          test -s "$DRIVER" || { echo "xenos.c nao encontrado antes do patch" >&2; exit 1; }
-
-          cp "$DRIVER" "$RUNNER_TEMP/xenos.c.pre-xwt-patch"
-          echo "Original salvo em $RUNNER_TEMP/xenos.c.pre-xwt-patch"
-
-          # --- helpers --------------------------------------------------
-          cat > "$RUNNER_TEMP/validate_xenos.py" <<'PYVALIDATE'
+          python3 "$PROJECT_DIR/scripts/patch_xenos_driver.py" "$RUNNER_TEMP/buildroot-output"
+          DRIVER="$(find "$RUNNER_TEMP/buildroot-output/build" -maxdepth 6 -type f -path '*/drivers/gpu/drm/tiny/xenos.c' -print -quit)"
+          test -s "$DRIVER"
+          grep -q 'XWT-0.15.0: guarded 32x32 tiled scanout' "$DRIVER"
+          # Repair the driver's diagnostic string if the patcher emitted a literal newline inside it.
+          python3 - "$DRIVER" <<'PYFIX'
           import sys
           from pathlib import Path
-
-          def strip_strings_comments(text):
-              out=[]; i=0; n=len(text)
-              while i<n:
-                  if text.startswith('/*',i):
-                      j=text.find('*/',i+2)
-                      if j==-1: j=n; out.append(' '*(j-i)); i=j
-                      else: out.append(' '*(j+2-i)); i=j+2
-                  elif text.startswith('//',i):
-                      j=text.find('\n',i)
-                      if j==-1: j=n
-                      out.append(' '*(j-i)); i=j
-                  elif text[i] in '"\'':
-                      q=text[i]; out.append(q); i+=1
-                      while i<n:
-                          if text[i]=='\\' and i+1<n: out.append('..'); i+=2
-                          elif text[i]==q: out.append(q); i+=1; break
-                          elif text[i]=='\n': break
-                          else: out.append('.'); i+=1
-                  else: out.append(text[i]); i+=1
-              return ''.join(out)
-
-          def logical_units(text):
-              lines=text.split('\n'); units=[]; i=0
-              while i<len(lines):
-                  s=i
-                  while lines[i].rstrip().endswith('\\') and i+1<len(lines): i+=1
-                  units.append((s,i,'\n'.join(lines[s:i+1]))); i+=1
-              return units
-
-          path=Path(sys.argv[1])
-          text=path.read_text(encoding='utf-8',errors='replace')
-          issues=[]
-          for s,e,unit in logical_units(text):
-              if not unit.strip(): continue
-              c=strip_strings_comments(unit)
-              if c.count('"')%2==1:
-                  issues.append(('unbalanced_quotes',s+1,unit.split('\n')[0].strip()[:120]))
-              if 'dev_err' in unit and c.count('(')!=c.count(')'):
-                  issues.append(('unbalanced_dev_err',s+1,unit.split('\n')[0].strip()[:120]))
-          if issues:
-              print(f'{len(issues)} problema(s) de sintaxe C:',file=sys.stderr)
-              for k,l,snip in issues:
-                  print(f'  [{k}] linha {l}: {snip}',file=sys.stderr)
-              sys.exit(1)
-          print('Validacao OK')
-          PYVALIDATE
-
-          cat > "$RUNNER_TEMP/repair_xenos.py" <<'PYREPAIR'
-          import re, sys
-          from pathlib import Path
-
-          def strip_strings_comments(text):
-              out=[]; i=0; n=len(text)
-              while i<n:
-                  if text.startswith('/*',i):
-                      j=text.find('*/',i+2)
-                      if j==-1: j=n; out.append(' '*(j-i)); i=j
-                      else: out.append(' '*(j+2-i)); i=j+2
-                  elif text.startswith('//',i):
-                      j=text.find('\n',i)
-                      if j==-1: j=n
-                      out.append(' '*(j-i)); i=j
-                  elif text[i] in '"\'':
-                      q=text[i]; out.append(q); i+=1
-                      while i<n:
-                          if text[i]=='\\' and i+1<n: out.append('..'); i+=2
-                          elif text[i]==q: out.append(q); i+=1; break
-                          elif text[i]=='\n': break
-                          else: out.append('.'); i+=1
-                  else: out.append(text[i]); i+=1
-              return ''.join(out)
-
-          def find_quote_insertion(unit):
-              # 1) depois do último format spec (mais confiável)
-              cands=[]
-              for m in re.finditer(r'%[-+ #0]*\d*(?:\.\d+)?[hlLzjt]*[diouxXeEfFgGaAcspn%]', unit):
-                  cands.append(m.end())
-              cands=sorted(set(cands), reverse=True)
-              # 2) antes de ");" no fim
-              m=re.search(r'\);', unit)
-              if m: cands.append(m.start())
-              # 3) antes de vírgulas (da última p/ primeira)
-              for m in reversed(list(re.finditer(r',', unit))):
-                  cands.append(m.start())
-              # 4) antes do último ';'
-              idx=unit.rfind(';')
-              if idx!=-1: cands.append(idx)
-              for pos in cands:
-                  if pos < 0 or pos > len(unit): continue
-                  before=strip_strings_comments(unit[:pos])
-                  if before.count('"')%2==1:  # dentro de string aberta
-                      trial=unit[:pos]+'"'+unit[pos:]
-                      if strip_strings_comments(trial).count('"')%2==0:
-                          return pos
-              return None
-
-          def find_paren_insertion(unit):
-              c=strip_strings_comments(unit)
-              if c.count('(') - c.count(')') != 1:
-                  return None
-              idx=unit.rfind(';')
-              if idx!=-1:
-                  trial=unit[:idx]+')'+unit[idx:]
-                  tc=strip_strings_comments(trial)
-                  if tc.count('(')==tc.count(')'):
-                      return idx
-              trial=unit+')'
-              tc=strip_strings_comments(trial)
-              if tc.count('(')==tc.count(')'):
-                  return len(unit)
-              return None
-
-          path=Path(sys.argv[1])
-          text=path.read_text(encoding='utf-8',errors='replace')
-          lines=text.split('\n')
-          units=[]; i=0
-          while i<len(lines):
-              s=i
-              while lines[i].rstrip().endswith('\\') and i+1<len(lines): i+=1
-              units.append((s,i)); i+=1
-
-          repairs=0
-          for s,e in units:
-              unit='\n'.join(lines[s:e+1])
-              if 'dev_err' not in unit: continue
-              cur=unit
-              if strip_strings_comments(cur).count('"')%2==1:
-                  pos=find_quote_insertion(cur)
-                  if pos is not None:
-                      cur=cur[:pos]+'"'+cur[pos:]
-              if strip_strings_comments(cur).count('(') != strip_strings_comments(cur).count(')'):
-                  pos=find_paren_insertion(cur)
-                  if pos is not None:
-                      cur=cur[:pos]+')'+cur[pos:]
-              if cur!=unit:
-                  lines[s:e+1]=cur.split('\n')
-                  repairs+=1
-                  print(f'  [linha {s+1}] reparo aplicado')
-          if repairs:
-              path.write_text('\n'.join(lines),encoding='utf-8')
-          print(f'{repairs} reparo(s) aplicado(s)')
-          PYREPAIR
-
-          # --- aplicar patch original ----------------------------------
-          python3 "$PROJECT_DIR/scripts/patch_xenos_driver.py" "$OUTPUT" || true
-          cp "$DRIVER" "$RUNNER_TEMP/xenos.c.post-xwt-patch"
-
-          echo "=== [1/3] Validando patch original ==="
-          if python3 "$RUNNER_TEMP/validate_xenos.py" "$DRIVER"; then
-            echo "XWT_PATCH_RESULT=applied" >> "$GITHUB_ENV"
-            diff -u "$RUNNER_TEMP/xenos.c.pre-xwt-patch" "$DRIVER" > "$RUNNER_TEMP/xenos-patch.diff" || true
-            echo "Patch original valido. Marcador:"
-            grep -n 'XWT-0.15.0: guarded 32x32 tiled scanout' "$DRIVER" || true
-            exit 0
-          fi
-
-          echo "=== [2/3] Reparando C do driver ==="
-          cp "$DRIVER" "$RUNNER_TEMP/xenos.c.broken-xwt-patch"
-          python3 "$RUNNER_TEMP/repair_xenos.py" "$DRIVER" || true
-
-          if python3 "$RUNNER_TEMP/validate_xenos.py" "$DRIVER"; then
-            echo "XWT_PATCH_RESULT=repaired" >> "$GITHUB_ENV"
-            diff -u "$RUNNER_TEMP/xenos.c.pre-xwt-patch" "$DRIVER" > "$RUNNER_TEMP/xenos-patch.diff" || true
-            echo "=== Diff do patch reparado (primeiras 240 linhas) ==="
-            head -240 "$RUNNER_TEMP/xenos-patch.diff" || true
-            echo "Reparo automatico OK. Marcador:"
-            grep -n 'XWT-0.15.0: guarded 32x32 tiled scanout' "$DRIVER" || true
-            exit 0
-          fi
-
-          echo "=== [3/3] Reparo falhou; revertendo para o original ==="
-          echo "XWT_PATCH_RESULT=reverted" >> "$GITHUB_ENV"
-          cp "$RUNNER_TEMP/xenos.c.pre-xwt-patch" "$DRIVER"
-          diff -u "$RUNNER_TEMP/xenos.c.broken-xwt-patch" "$RUNNER_TEMP/xenos.c.pre-xwt-patch" > "$RUNNER_TEMP/xenos-revert.diff" || true
-          echo "::warning::Nao foi possivel reparar xenos.c; revertendo patch. Build prossegue sem tiling fix."
-          exit 0
+          p = Path(sys.argv[1])
+          s = p.read_text(encoding="utf-8")
+          broken = 'invalid Xenos scanout dimensions: %ux%u\n",'
+          fixed = 'invalid Xenos scanout dimensions: %ux%u\\n",'
+          if broken in s:
+              s = s.replace(broken, fixed)
+              p.write_text(s, encoding="utf-8")
+              print("Fixed newline in Xenos diagnostic string.")
+          if 'invalid Xenos scanout dimensions: %ux%u\\n",' not in s:
+              raise SystemExit("Xenos diagnostic string is still malformed")
+          PYFIX
 
       - name: Build kernel and 0.15.0 desktop root filesystem
         shell: bash
         run: |
           set -Eeuo pipefail
           JOBS="$(nproc)"; [ "$JOBS" -le 4 ] || JOBS=4
-          echo "Building XWT 0.15.0 desktop core with $JOBS workers (XWT_PATCH_RESULT=${XWT_PATCH_RESULT:-unset})"
+          echo "Building XWT 0.15.0 desktop core with $JOBS workers"
           ccache --zero-stats || true
           make -C "$BUILDROOT_DIR" O="$RUNNER_TEMP/buildroot-output" -j"$JOBS" 2>&1 | tee "$RUNNER_TEMP/buildroot-build.log"
           OUTPUT="$RUNNER_TEMP/buildroot-output"; TARGET="$OUTPUT/target"
@@ -790,8 +622,7 @@ jobs:
                 "physical_console_tested":False,"nand_write":False}}
           Path(metadata).write_text(json.dumps(data,indent=2)+'\n')
           PY
-          printf 'XWT Linux %s\nDesktop + controller + connectivity build\nCommit: %s\nBuildroot: %s\nFree60: %s\nXenos patch result: %s\n' \
-            "$XWT_VERSION" "$GITHUB_SHA" "$BUILDROOT_COMMIT" "$FREE60_COMMIT" "${XWT_PATCH_RESULT:-unset}" > "$RUNNER_TEMP/BUILD-REPORT.txt"
+          printf 'XWT Linux %s\nDesktop + controller + connectivity build\nCommit: %s\nBuildroot: %s\nFree60: %s\n' "$XWT_VERSION" "$GITHUB_SHA" "$BUILDROOT_COMMIT" "$FREE60_COMMIT" > "$RUNNER_TEMP/BUILD-REPORT.txt"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
@@ -822,11 +653,6 @@ jobs:
             ${{ runner.temp }}/buildroot-build.log
             ${{ runner.temp }}/free60-commit.txt
             ${{ runner.temp }}/buildroot-commit.txt
-            ${{ runner.temp }}/xenos.c.pre-xwt-patch
-            ${{ runner.temp }}/xenos.c.post-xwt-patch
-            ${{ runner.temp }}/xenos.c.broken-xwt-patch
-            ${{ runner.temp }}/xenos-patch.diff
-            ${{ runner.temp }}/xenos-revert.diff
           if-no-files-found: ignore
           retention-days: 14
 
@@ -835,12 +661,8 @@ jobs:
         run: |
           {
             echo '## XWT Linux 0.15.0 — Desktop + Controller + Connectivity'
-            case "${XWT_PATCH_RESULT:-unset}" in
-              applied)  echo '✅ Xenos tiling fix aplicado (patch original válido).' ;;
-              repaired) echo '🔧 Xenos tiling fix aplicado após reparo automático do C.' ;;
-              reverted) echo '⚠️ Xenos tiling fix revertido (C inválido); build segue sem ele.' ;;
-              *)        echo '❔ Xenos patch não executado (verifique etapa Patch Xenos).' ;;
-            esac
+            echo 'Build compiles the Xenon kernel, SDL desktop, controller bridge and full 0.15.0 root filesystem.'
+            echo 'Includes Wi-Fi utilities and guarded Xenos tiled scanout correction; hardware support still requires console testing.'
             echo 'Boot: default.xex -> XellLaunch2 -> XeLL Reloaded -> ELF32 zImage.xenon wrapper + PPC64 kernel + initramfs.'
             echo 'NAND writes: none. Physical Xbox 360 test: pending; automated CI is not a console test.'
           } >> "$GITHUB_STEP_SUMMARY"
