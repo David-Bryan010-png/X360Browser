@@ -101,9 +101,11 @@ jobs:
           from pathlib import Path, PurePosixPath
           root, output = Path(sys.argv[1]), Path(sys.argv[2])
           candidates = sorted(root.glob("XWT-Linux-GitHub-Upload*.zip"))
+          candidates += sorted(root.glob("XWT-Linux-*-setup*.zip"))
+          candidates = list(dict.fromkeys(p for p in candidates if p.is_file()))
           if len(candidates) != 1:
               raise SystemExit(
-                  "Envie um unico XWT-Linux-GitHub-Upload*.zip para a raiz do repositorio. "
+                  "Envie um unico pacote XWT-Linux-GitHub-Upload*.zip ou XWT-Linux-*-setup*.zip para a raiz do repositorio. "
                   "Encontrados: " + ", ".join(p.name for p in candidates)
               )
           wrapper = candidates[0]
@@ -233,13 +235,45 @@ jobs:
           test -s "$FREE60_DIR/xenon-7.2.defconfig"
           test -s "$FREE60_DIR/patch-7.2-xenon0.30.diff"
           python3 - "$FREE60_DIR/patch-7.2-xenon0.30.diff" <<'PY'
+          import re
           import sys
           from pathlib import Path
-          patch = Path(sys.argv[1]).read_text(errors="replace")
-          required = ("config PPC_XENON", "depends on PPC64", "default y", "image-$(CONFIG_PPC_XENON) += zImage.xenon")
-          missing = [token for token in required if token not in patch]
+
+          patch = Path(sys.argv[1]).read_text(
+              encoding="utf-8",
+              errors="replace"
+          )
+
+          # O diff Free60 usa tabs e alinhamento variável. Validar linhas
+          # por expressão regular evita rejeitar o patch correto por espaços.
+          required = {
+              "CONFIG_PPC_XENON":
+                  r"(?m)^\+\s*config\s+PPC_XENON\s*$",
+              "dependência PPC64":
+                  r"(?m)^\+\s*depends\s+on\s+PPC64\s*$",
+              "PPC_XENON habilitado por padrão":
+                  r"(?m)^\+\s*default\s+y\s*$",
+              "regra de imagem Xenon":
+                  r"(?m)^\+image-\$\(CONFIG_PPC_XENON\)\s*\+=\s*zImage\.xenon\s*$",
+              "alvo zImage.xenon":
+                  r"(?m)^\+\$\(obj\)/zImage\.xenon:\s*\$\(obj\)/vmlinux\.strip\s*$",
+              "conversão ELF32 PowerPC":
+                  r"(?m)^\+\s*@?\$\(OBJCOPY\)\s+-O\s+elf32-powerpc\s+\$<\s+\$@\s*$",
+          }
+
+          missing = [
+              name
+              for name, pattern in required.items()
+              if re.search(pattern, patch) is None
+          ]
+
           if missing:
-              raise SystemExit("Free60 patch does not define the expected Xenon platform/wrapper: " + ", ".join(missing))
+              raise SystemExit(
+                  "Patch Free60 incompatível ou incompleto; faltam entradas reais do diff: "
+                  + ", ".join(missing)
+              )
+
+          print("Patch Free60 validado: plataforma Xenon e wrapper ELF32 encontrados.")
           PY
           cp "$FREE60_DIR/xenon-7.2.defconfig" "$PROJECT_DIR/linux/xenon-7.2.defconfig"
           printf '%s\n' "$FREE60_COMMIT" > "$PROJECT_DIR/linux/FREE60-KERNEL-COMMIT.txt"
@@ -379,6 +413,15 @@ jobs:
             grep -q "$required" "$KERNEL_CONFIG" || { echo "Generated Linux Kconfig missing: $required" >&2; sed -n '/PPC_XENON/p;/PPC64/p' "$KERNEL_CONFIG" >&2 || true; exit 1; }
           done
           echo "Kconfig preflight passed; applying the guarded Xenos tiled-framebuffer correction."
+
+      - name: Ensure Buildroot post-build script is executable
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          POST_BUILD="$PROJECT_DIR/linux/post-build.sh"
+          test -s "$POST_BUILD" || { echo "linux/post-build.sh não existe" >&2; exit 1; }
+          chmod 0755 "$POST_BUILD"
+          test -x "$POST_BUILD"
 
       - name: Patch Xenos DRM tiled framebuffer safely
         shell: bash
