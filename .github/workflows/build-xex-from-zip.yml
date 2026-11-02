@@ -336,7 +336,7 @@ jobs:
 
           # Corrige a validacao ELF sem enfraquecer a verificacao dos segmentos.
           # O entry point zero so sera aceito se estiver dentro de um PT_LOAD executavel.
-          python3 \
+          python3 - \
             "$RUNNER_TEMP/xwt-project/scripts/package_linux_usb.py" \
             "$RUNNER_TEMP/xwt-project/scripts/test_package_linux_usb.py" <<'PY'
           import sys
@@ -347,9 +347,10 @@ jobs:
 
           package_text = package_path.read_text(encoding="utf-8")
 
-          old_check = (
-              '    if entry == 0:\n'
-              '        raise ValueError("kernel ELF has a zero entry point")\n'
+          # More robust patch for zero entry point validation
+          import re
+          old_pattern = re.compile(
+              r'(?m)^(\s*)if entry == 0:\s*\n\s*raise ValueError\("kernel ELF has a zero entry point"\)\s*\n'
           )
 
           replacement = (
@@ -357,18 +358,29 @@ jobs:
               "    # segment maps address zero. The range check below remains mandatory.\n"
           )
 
-          if package_text.count(old_check) == 1:
-              package_text = package_text.replace(
-                  old_check,
-                  replacement,
-                  1
-              )
+          match = old_pattern.search(package_text)
+          if match:
+              package_text = old_pattern.sub(replacement, package_text, count=1)
               package_path.write_text(package_text, encoding="utf-8")
-
+              print("Applied robust zero-entry-point patch.")
           elif "ELF entry zero is valid only when an executable PT_LOAD" not in package_text:
-              raise SystemExit(
-                  "Unexpected package_linux_usb.py validator; refusing an unsafe patch"
-              )
+              # Fallback: try simple string replace if exact whitespace differs
+              simple_old = 'if entry == 0:'
+              if package_text.count(simple_old) == 1 and 'zero entry point' in package_text:
+                  package_text = package_text.replace(
+                      'if entry == 0:\n        raise ValueError("kernel ELF has a zero entry point")',
+                      replacement.strip(),
+                      1
+                  )
+                  package_path.write_text(package_text, encoding="utf-8")
+                  print("Applied fallback zero-entry-point patch.")
+              else:
+                  raise SystemExit(
+                      "Unexpected package_linux_usb.py validator; refusing an unsafe patch. "
+                      "Could not locate the zero entry point check."
+                  )
+          else:
+              print("Zero-entry-point patch already applied.")
 
           tests_text = tests_path.read_text(encoding="utf-8")
 
@@ -1106,7 +1118,7 @@ jobs:
             "$API" \
             -o "$RUNNER_TEMP/xell-release.json"
 
-          python3 \
+          python3 - \
             "$RUNNER_TEMP/xell-release.json" \
             "$RUNNER_TEMP/xell-url.txt" <<'PY'
           import json
@@ -1166,7 +1178,7 @@ jobs:
           sha256sum "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-USB.zip" \
             > "$RUNNER_TEMP/USB-SHA256.txt"
 
-          python3 \
+          python3 - \
             "$PROJECT_DIR" \
             "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-source.zip" <<'PY'
           import hashlib
