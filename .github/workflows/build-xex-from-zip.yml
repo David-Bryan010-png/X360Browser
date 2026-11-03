@@ -1115,6 +1115,35 @@ jobs:
         run: |
           set -Eeuo pipefail
 
+          # Use a local launcher if the user already has one in the repo.
+          LOCAL_LAUNCHER=""
+          for candidate in \
+            "$GITHUB_WORKSPACE/XellLaunch2.xex" \
+            "$GITHUB_WORKSPACE/default.xex" \
+            "$GITHUB_WORKSPACE/XellLaunch2-retail.xex"; do
+            if [ -s "$candidate" ]; then
+              LOCAL_LAUNCHER="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$LOCAL_LAUNCHER" ]; then
+            echo "Using local launcher: $LOCAL_LAUNCHER"
+            cp "$LOCAL_LAUNCHER" "$RUNNER_TEMP/default.xex"
+            # Still need a license file for the package; fetch it.
+            curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              "https://raw.githubusercontent.com/mitchellwaite/XellLaunch2/${XELL_LAUNCH2_COMMIT}/LICENSE" \
+              -o "$RUNNER_TEMP/XellLaunch2-LICENSE.txt" || \
+              printf 'MIT License\n' > "$RUNNER_TEMP/XellLaunch2-LICENSE.txt"
+            test "$(head -c 4 "$RUNNER_TEMP/default.xex")" = "XEX2"
+            echo "Local launcher accepted."
+            exit 0
+          fi
+
           API="https://api.github.com/repos/mitchellwaite/XellLaunch2/releases/tags/${XELL_LAUNCH2_TAG}"
 
           curl \
@@ -1126,7 +1155,7 @@ jobs:
             "$API" \
             -o "$RUNNER_TEMP/xell-release.json"
 
-          python3 \
+          python3 - \
             "$RUNNER_TEMP/xell-release.json" \
             "$RUNNER_TEMP/xell-url.txt" <<'PY'
           import json
@@ -1193,7 +1222,7 @@ jobs:
             "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-USB.zip" \
             > "$RUNNER_TEMP/USB-SHA256.txt"
 
-          python3 \
+          python3 - \
             "$PROJECT_DIR" \
             "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-source.zip" <<'PY'
           import hashlib
@@ -1254,7 +1283,7 @@ jobs:
             | awk '{print $1 "  system.xwpkg"}' \
             > "$RUNNER_TEMP/system-SHA256.txt"
 
-          python3 \
+          python3 - \
             "$RUNNER_TEMP/latest.tsv" \
             "$RUNNER_TEMP/latest.json" \
             "$GITHUB_REPOSITORY" \
@@ -1472,7 +1501,7 @@ jobs:
               --dir "$RUNNER_TEMP/stable" || true
           fi
 
-          python3 \
+          python3 - \
             latest.tsv \
             "$RUNNER_TEMP/stable/latest.tsv" <<'PY'
           import sys
