@@ -581,7 +581,7 @@ jobs:
               "BR2_CCACHE": "y",
               "BR2_CCACHE_DIR":
                   f'"{home}/.cache/xwt-buildroot-ccache"',
-              "BR2_LINUX_KERNEL_INSTALL_TARGET": "y",
+              "BR2_LINUX_KERNEL_INSTALL_TARGET":"y",
               "BR2_LINUX_KERNEL_PATCH":
                   f'"{free60_dir}/patch-7.2-xenon0.30.diff"',
           }
@@ -700,6 +700,10 @@ jobs:
           print("Xenon kernel image excluded from PPC64 rootfs installation.")
           PY
 
+      # CONFIG_PPC_XENON is intentionally NOT expected in this raw defconfig.
+      # Free60's patch adds the Kconfig symbol (depends on PPC64, default y).
+      # Its final value is checked after Linux Kconfig runs in the preflight step.
+
       - name: Preflight Xenon Linux Kconfig before full compilation
         shell: bash
         run: |
@@ -793,16 +797,32 @@ jobs:
           path = Path(sys.argv[1])
           content = path.read_text(encoding="utf-8")
 
-          broken = 'invalid Xenos scanout dimensions: %ux%u\n",'
-          fixed = 'invalid Xenos scanout dimensions: %ux%u\\n",'
+          # re.sub in patch_xenos_driver.py writes this call with literal
+          # backslashes before the quotes. gcc then dies at xenos.c.
+          broken_dma = 'dev_err(&pdev->dev, \\"Xenos requires 32-bit DMA addressing\\n\\");'
+          fixed_dma = 'dev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");'
+          if content.count(broken_dma) != 1:
+              raise SystemExit(
+                  "Xenos DMA string not in the expected broken form: "
+                  + str(content.count(broken_dma))
+              )
+          content = content.replace(broken_dma, fixed_dma, 1)
 
-          if broken in content:
-              content = content.replace(broken, fixed)
-              path.write_text(content, encoding="utf-8")
-              print("Fixed Xenos diagnostic string.")
+          broken_dims = 'invalid Xenos scanout dimensions: %ux%u\n",'
+          fixed_dims = 'invalid Xenos scanout dimensions: %ux%u\\n",'
+          if broken_dims in content:
+              content = content.replace(broken_dims, fixed_dims)
+              print("Fixed Xenos dimension diagnostic string.")
+
+          path.write_text(content, encoding="utf-8")
 
           if 'invalid Xenos scanout dimensions: %ux%u\\n",' not in content:
-              raise SystemExit("Xenos diagnostic string is malformed.")
+              raise SystemExit("Xenos dimension diagnostic string is malformed.")
+          if fixed_dma not in content:
+              raise SystemExit("Xenos DMA diagnostic string is still malformed.")
+          if '\\"' in content:
+              raise SystemExit("Xenos driver still contains escaped quotes.")
+          print("Xenos driver strings are valid C.")
           PYFIX
 
       - name: Build kernel and 0.15.0 desktop root filesystem
