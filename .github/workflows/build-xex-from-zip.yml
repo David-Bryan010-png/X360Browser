@@ -817,7 +817,7 @@ jobs:
           for line in lines:
               if "Xenos requires 32-bit DMA addressing" in line or "\x01" in line:
                   if not replaced:
-                      out.append('\tdev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");\n')
+                      out.append('\tdev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\\\n");\n')
                       replaced = True
                   continue
               out.append(line)
