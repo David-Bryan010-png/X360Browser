@@ -821,6 +821,12 @@ jobs:
           path = Path(sys.argv[1])
           content = path.read_text(encoding="utf-8")
 
+          # The patch replacement can emit a real 0x01 byte from a bad \1.
+          # Remove it so gcc does not see a stray control character.
+          if "\x01" in content:
+              content = content.replace("\x01", "")
+              print("Removed stray 0x01 from Xenos driver.")
+
           # re.sub in patch_xenos_driver.py writes this call with literal
           # backslashes before the quotes. gcc then dies at xenos.c.
           broken_dma = 'dev_err(&pdev->dev, \\"Xenos requires 32-bit DMA addressing\\n\\");'
