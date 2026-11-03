@@ -1,3 +1,4 @@
+
 name: XWT Linux 0.15.0 - Build Xenon desktop core
 
 # Builds the Xenon kernel, SDL desktop, USB package and launcher.
@@ -824,12 +825,16 @@ jobs:
           # backslashes before the quotes. gcc then dies at xenos.c.
           broken_dma = 'dev_err(&pdev->dev, \\"Xenos requires 32-bit DMA addressing\\n\\");'
           fixed_dma = 'dev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");'
-          if content.count(broken_dma) != 1:
+          # Accept either the old broken form or the already-correct form.
+          if content.count(broken_dma) == 1:
+              content = content.replace(broken_dma, fixed_dma, 1)
+              print("Fixed Xenos DMA diagnostic string.")
+          elif fixed_dma in content:
+              print("Xenos DMA string already valid.")
+          else:
               raise SystemExit(
-                  "Xenos DMA string not in the expected broken form: "
-                  + str(content.count(broken_dma))
+                  "Xenos DMA string not found in broken or fixed form."
               )
-          content = content.replace(broken_dma, fixed_dma, 1)
 
           broken_dims = 'invalid Xenos scanout dimensions: %ux%u\n",'
           fixed_dims = 'invalid Xenos scanout dimensions: %ux%u\\n",'
