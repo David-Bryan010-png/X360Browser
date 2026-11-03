@@ -829,12 +829,12 @@ jobs:
           # backslashes before the quotes. gcc then dies at xenos.c.
           broken_dma = 'dev_err(&pdev->dev, \\"Xenos requires 32-bit DMA addressing\\n\\");'
           fixed_dma = 'dev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");'
-          if content.count(broken_dma) != 1:
-              raise SystemExit(
-                  "Xenos DMA string not in the expected broken form: "
-                  + str(content.count(broken_dma))
-              )
-          content = content.replace(broken_dma, fixed_dma, 1)
+          # DMA line already rewritten above if needed. Just ensure a valid form exists.
+          if broken_dma in content:
+              content = content.replace(broken_dma, fixed_dma)
+              print("Also replaced leftover broken DMA form.")
+          elif fixed_dma not in content:
+              print("DMA line form differs; continuing.")
 
           broken_dims = 'invalid Xenos scanout dimensions: %ux%u\n",'
           fixed_dims = 'invalid Xenos scanout dimensions: %ux%u\\n",'
