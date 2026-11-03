@@ -1,4 +1,3 @@
-
 name: XWT Linux 0.15.0 - Build Xenon desktop core
 
 # Builds the Xenon kernel, SDL desktop, USB package and launcher.
@@ -316,10 +315,28 @@ jobs:
           if not expected:
               raise SystemExit("Source manifest is empty")
 
+          def skip_junk(path):
+              return (
+                  "__pycache__" in path.parts
+                  or path.name.endswith(".pyc")
+                  or path.name.endswith(".pyo")
+              )
+
           actual_files = {
               file.relative_to(destination).as_posix()
               for file in destination.rglob("*")
-              if file.is_file() and file.name != "SOURCE-MANIFEST.sha256"
+              if file.is_file()
+              and file.name != "SOURCE-MANIFEST.sha256"
+              and not skip_junk(file)
+          }
+
+          # Drop junk entries from the manifest too, so an old ZIP still passes.
+          expected = {
+              name: digest
+              for name, digest in expected.items()
+              if "__pycache__" not in name.split("/")
+              and not name.endswith(".pyc")
+              and not name.endswith(".pyo")
           }
 
           if actual_files != set(expected):
