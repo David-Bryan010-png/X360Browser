@@ -821,24 +821,23 @@ jobs:
           path = Path(sys.argv[1])
           content = path.read_text(encoding="utf-8")
 
-          # The patch replacement can emit a real 0x01 byte from a bad \1.
-          # Remove it so gcc does not see a stray control character.
-          if "\x01" in content:
-              content = content.replace("\x01", "")
-              print("Removed stray 0x01 from Xenos driver.")
-
-          # re.sub in patch_xenos_driver.py writes this call with literal
-          # backslashes before the quotes. gcc then dies at xenos.c.
-          broken_dma = 'dev_err(&pdev->dev, \\"Xenos requires 32-bit DMA addressing\\n\\");'
+          # Rewrite any DMA diagnostic line to valid C.
+          lines = content.splitlines(keepends=True)
+          out = []
+          replaced = False
+          for line in lines:
+              if "Xenos requires 32-bit DMA addressing" in line or "\x01" in line:
+                  if not replaced:
+                      out.append('\tdev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");\n')
+                      replaced = True
+                  continue
+              out.append(line)
+          content = "".join(out)
           fixed_dma = 'dev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");'
-          # Accept either the old broken form or the already-correct form.
-          if broken_dma in content:
-              content = content.replace(broken_dma, fixed_dma)
-              print("Fixed Xenos DMA diagnostic string.")
-          elif fixed_dma in content:
-              print("Xenos DMA string already valid.")
+          if replaced:
+              print("Rewrote Xenos DMA diagnostic line.")
           else:
-              print("Xenos DMA string not in known form; continuing.")
+              print("Xenos DMA line not found; continuing.")
 
           broken_dims = 'invalid Xenos scanout dimensions: %ux%u\n",'
           fixed_dims = 'invalid Xenos scanout dimensions: %ux%u\\n",'
