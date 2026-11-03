@@ -1,11 +1,6 @@
 
 name: XWT Linux 0.15.0 - Build Xenon desktop core
 
-# Builds the Xenon kernel, SDL desktop, USB package and launcher.
-# Source comes from XWT-Linux-GitHub-Upload-4.zip at the repository root.
-# Xenos step blanks the display before scanout (avoids chuvisco/blue screen)
-# and the PYFIX corrects any leftover escaped-quote strings.
-
 on:
   workflow_dispatch:
 
@@ -316,28 +311,10 @@ jobs:
           if not expected:
               raise SystemExit("Source manifest is empty")
 
-          def skip_junk(path):
-              return (
-                  "__pycache__" in path.parts
-                  or path.name.endswith(".pyc")
-                  or path.name.endswith(".pyo")
-              )
-
           actual_files = {
               file.relative_to(destination).as_posix()
               for file in destination.rglob("*")
-              if file.is_file()
-              and file.name != "SOURCE-MANIFEST.sha256"
-              and not skip_junk(file)
-          }
-
-          # Drop junk entries from the manifest too, so an old ZIP still passes.
-          expected = {
-              name: digest
-              for name, digest in expected.items()
-              if "__pycache__" not in name.split("/")
-              and not name.endswith(".pyc")
-              and not name.endswith(".pyo")
+              if file.is_file() and file.name != "SOURCE-MANIFEST.sha256"
           }
 
           if actual_files != set(expected):
@@ -790,7 +767,6 @@ jobs:
           test -x "$POST_BUILD"
 
       - name: Patch Xenos DRM tiled framebuffer safely
-        # Blanks D1GRPH before setup (chuvisco fix) and corrects DMA strings.
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -821,23 +797,16 @@ jobs:
           path = Path(sys.argv[1])
           content = path.read_text(encoding="utf-8")
 
-          # Rewrite any DMA diagnostic line to valid C.
-          lines = content.splitlines(keepends=True)
-          out = []
-          replaced = False
-          for line in lines:
-              if "Xenos requires 32-bit DMA addressing" in line or "\x01" in line:
-                  if not replaced:
-                      out.append('\tdev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");\n')
-                      replaced = True
-                  continue
-              out.append(line)
-          content = "".join(out)
+          # re.sub in patch_xenos_driver.py writes this call with literal
+          # backslashes before the quotes. gcc then dies at xenos.c.
+          broken_dma = 'dev_err(&pdev->dev, \\"Xenos requires 32-bit DMA addressing\\n\\");'
           fixed_dma = 'dev_err(&pdev->dev, "Xenos requires 32-bit DMA addressing\\n");'
-          if replaced:
-              print("Rewrote Xenos DMA diagnostic line.")
-          else:
-              print("Xenos DMA line not found; continuing.")
+          if content.count(broken_dma) != 1:
+              raise SystemExit(
+                  "Xenos DMA string not in the expected broken form: "
+                  + str(content.count(broken_dma))
+              )
+          content = content.replace(broken_dma, fixed_dma, 1)
 
           broken_dims = 'invalid Xenos scanout dimensions: %ux%u\n",'
           fixed_dims = 'invalid Xenos scanout dimensions: %ux%u\\n",'
@@ -848,11 +817,11 @@ jobs:
           path.write_text(content, encoding="utf-8")
 
           if 'invalid Xenos scanout dimensions: %ux%u\\n",' not in content:
-              print("Xenos dimension string form differs; continuing.")
+              raise SystemExit("Xenos dimension diagnostic string is malformed.")
           if fixed_dma not in content:
-              print("Xenos DMA string differs; continuing anyway.")
+              raise SystemExit("Xenos DMA diagnostic string is still malformed.")
           if '\\"' in content:
-              print("Warning: escaped quotes remain; continuing.")
+              raise SystemExit("Xenos driver still contains escaped quotes.")
           print("Xenos driver strings are valid C.")
           PYFIX
 
