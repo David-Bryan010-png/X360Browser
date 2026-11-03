@@ -1,6 +1,11 @@
 
 name: XWT Linux 0.15.0 - Build Xenon desktop core
 
+# Builds the Xenon kernel, SDL desktop, USB package and launcher.
+# Source comes from XWT-Linux-GitHub-Upload-4.zip at the repository root.
+# Xenos step blanks the display before scanout (avoids chuvisco/blue screen)
+# and the PYFIX corrects any leftover escaped-quote strings.
+
 on:
   workflow_dispatch:
 
@@ -767,6 +772,7 @@ jobs:
           test -x "$POST_BUILD"
 
       - name: Patch Xenos DRM tiled framebuffer safely
+        # Blanks D1GRPH before setup (chuvisco fix) and corrects DMA strings.
         shell: bash
         run: |
           set -Eeuo pipefail
