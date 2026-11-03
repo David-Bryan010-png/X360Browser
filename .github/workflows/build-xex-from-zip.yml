@@ -392,6 +392,7 @@ jobs:
           p.write_text(s.replace(old,"\t# XWT: keep Xenon boot image in images/, outside PPC64 rootfs.\n",1))
           PY
 
+      # CONFIG_PPC_XENON is intentionally NOT expected in the raw defconfig.
       - name: Preflight Linux Xenon Kconfig
         shell: bash
         run: |
