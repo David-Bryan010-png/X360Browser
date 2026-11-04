@@ -212,6 +212,11 @@ jobs:
               "linux/overlay/usr/sbin/xwt-system-menu",
               "linux/overlay/usr/sbin/xwt-system-menu-text",
               "linux/overlay/usr/sbin/xwt-network",
+              "linux/overlay/usr/sbin/xwt-storage",
+              "tools/xwt-kboot.py",
+              "docs/BOOT-TROUBLESHOOTING-PT-BR.md",
+              "scripts/test_xwt_storage.py",
+              "scripts/test_kboot_menu.py",
               "linux/overlay/usr/sbin/xwt-wifi",
               "linux/overlay/usr/sbin/xwt-video-check",
               "linux/overlay/usr/sbin/xwt-update",
@@ -381,6 +386,8 @@ jobs:
             test_xwt_gamepad \
             test_xwt_desktop \
             test_xwt_wifi \
+            test_xwt_storage \
+            test_kboot_menu \
             test_xenos_patch \
             test_xenos_tiling
 
@@ -817,7 +824,7 @@ jobs:
           test -s "$OUTPUT/images/rootfs.cpio.gz" || { echo "ERROR: rootfs.cpio.gz missing"; exit 1; }
           gzip -t "$OUTPUT/images/rootfs.cpio.gz"
 
-          for bin in xwt-system-menu xwt-system-menu-text xwt-update xwt-network xwt-wifi xwt-video-check xwt-desktop xwt-gamepad-keys; do
+          for bin in xwt-system-menu xwt-system-menu-text xwt-update xwt-storage xwt-network xwt-wifi xwt-video-check xwt-desktop xwt-gamepad-keys; do
             test -x "$TARGET/usr/sbin/$bin" || {
               echo "ERROR: $bin missing from rootfs" >&2
               exit 1
@@ -960,6 +967,7 @@ jobs:
               "usr/sbin/xwt-system-menu-text",
               "usr/sbin/xwt-update",
               "usr/sbin/xwt-network",
+              "usr/sbin/xwt-storage",
               "usr/sbin/xwt-wifi",
               "usr/sbin/xwt-video-check",
               "usr/sbin/xwt-desktop",
@@ -988,6 +996,7 @@ jobs:
               "usr/sbin/xwt-system-menu-text",
               "usr/sbin/xwt-update",
               "usr/sbin/xwt-network",
+              "usr/sbin/xwt-storage",
               "usr/sbin/xwt-wifi",
               "usr/sbin/xwt-video-check",
               "usr/sbin/xwt-desktop",
