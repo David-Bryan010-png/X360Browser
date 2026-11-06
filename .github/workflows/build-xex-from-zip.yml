@@ -210,6 +210,8 @@ jobs:
               "linux/overlay/usr/sbin/xwt-audio",
               "linux/overlay/usr/sbin/xwt-video",
               "scripts/test_xwt_audio_video.py",
+              "scripts/test_preflight.py",
+              "tools/xwt-preflight.py",
               "linux/overlay/etc/init.d/S40network",
               "linux/overlay/etc/init.d/S46time",
               "linux/overlay/etc/xwt/wpa_supplicant.conf.example",
@@ -224,6 +226,8 @@ jobs:
               "scripts/test_kboot_menu.py",
               "scripts/test_split_rootfs.py",
               "scripts/test_xwt_game.py",
+              "scripts/make_manifest.py",
+              "scripts/test_source_manifest.py",
               "linux/overlay/usr/sbin/xwt-game",
               "scripts/split_rootfs.py",
               "linux/packs.rules",
@@ -401,7 +405,9 @@ jobs:
             test_kboot_menu \
             test_split_rootfs \
             test_xwt_game \
+            test_source_manifest \
             test_xwt_audio_video \
+            test_preflight \
             test_xenos_patch \
             test_xenos_tiling
 
