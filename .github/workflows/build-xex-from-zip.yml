@@ -41,6 +41,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
           echo "Disk space before cleanup:"
           df -h
           sudo rm -rf -- \
@@ -68,6 +69,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential gcc g++ make bc bison flex gawk \
@@ -95,6 +97,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
           mkdir -p "$BR2_DL_DIR" "$CCACHE_DIR"
           ccache --set-config=max_size="$CCACHE_MAXSIZE"
           ccache --set-config=compression=true
@@ -104,6 +107,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
           SOURCE_ARCHIVE="$RUNNER_TEMP/XWT-Linux-source.zip"
           PROJECT_DEST="$RUNNER_TEMP/xwt-project"
 
@@ -226,9 +230,13 @@ jobs:
               "scripts/test_kboot_menu.py",
               "scripts/test_split_rootfs.py",
               "scripts/test_xwt_game.py",
+              "scripts/test_xwt_apps.py",
               "scripts/make_manifest.py",
               "scripts/test_source_manifest.py",
               "linux/overlay/usr/sbin/xwt-game",
+              "linux/overlay/usr/sbin/xwt-apps",
+              "linux/overlay/usr/sbin/xwt-doctor",
+              "linux/overlay/etc/init.d/S90report",
               "scripts/split_rootfs.py",
               "linux/packs.rules",
               "linux/overlay/usr/sbin/xwt-packs",
@@ -389,9 +397,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
           cd "$PROJECT_DIR/scripts"
 
-          python3 -m unittest -v \
+          if ! python3 -m unittest -v \
             test_package_linux_usb \
             test_xwpkg \
             test_nand_boundary \
@@ -405,16 +414,25 @@ jobs:
             test_kboot_menu \
             test_split_rootfs \
             test_xwt_game \
+            test_xwt_apps \
             test_source_manifest \
             test_xwt_audio_video \
             test_preflight \
             test_xenos_patch \
-            test_xenos_tiling
+            test_xenos_tiling > "$RUNNER_TEMP/unittest.log" 2>&1; then
+            cat "$RUNNER_TEMP/unittest.log" | tail -n 120
+            FAILED="$(grep -E '^(ERROR|FAIL):' "$RUNNER_TEMP/unittest.log" | tr '\n' ';' | cut -c1-900 || true)"
+            DETAIL="$(grep -E '(Error|Exception|assert)' "$RUNNER_TEMP/unittest.log" | head -n 8 | tr '\n' ';' | cut -c1-900 || true)"
+            echo "::error title=Testes falharam::${FAILED} ${DETAIL}"
+            exit 1
+          fi
+          tail -n 5 "$RUNNER_TEMP/unittest.log"
 
       - name: Fetch pinned Free60 Xenon kernel port
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           FREE60_DIR="$RUNNER_TEMP/free60-xenon"
 
@@ -553,6 +571,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           BUILDROOT_DIR="$RUNNER_TEMP/buildroot"
 
@@ -576,6 +595,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           mkdir -p "$OUTPUT"
@@ -647,6 +667,19 @@ jobs:
           require 'BR2_TOOLCHAIN_USES_GLIBC=y'
           require 'BR2_PACKAGE_BUSYBOX=y'
           require 'BR2_PACKAGE_KMOD=y'
+          require 'BR2_PACKAGE_PRBOOM=y'
+          require 'BR2_PACKAGE_DOOM_WAD=y'
+          require 'BR2_PACKAGE_LBREAKOUT2=y'
+          require 'BR2_PACKAGE_LTRIS=y'
+          require 'BR2_PACKAGE_OPENTYRIAN=y'
+          require 'BR2_PACKAGE_MPG123=y'
+          require 'BR2_PACKAGE_FBV=y'
+          require 'BR2_PACKAGE_FBGRAB=y'
+          require 'BR2_PACKAGE_UNZIP=y'
+          require 'BR2_PACKAGE_SDL_MIXER=y'
+          require 'BR2_PACKAGE_SDL_TTF=y'
+          require 'BR2_PACKAGE_ALSA_UTILS_AMIXER=y'
+          require 'BR2_PACKAGE_ALSA_UTILS_SPEAKER_TEST=y'
           require 'BR2_PACKAGE_KMOD_TOOLS=y'
           require 'BR2_PACKAGE_IPROUTE2=y'
           require 'BR2_PACKAGE_LIBCURL=y'
@@ -700,6 +733,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           MAKEFILE="$BUILDROOT_DIR/linux/linux.mk"
 
@@ -735,6 +769,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
 
@@ -786,6 +821,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           POST_BUILD="$PROJECT_DIR/linux/post-build.sh"
 
@@ -801,6 +837,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           python3 \
             "$PROJECT_DIR/scripts/patch_xenos_driver.py" \
@@ -834,6 +871,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           JOBS="$(nproc)"
           if [ "$JOBS" -gt 4 ]; then
@@ -1056,6 +1094,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           command -v mksquashfs
@@ -1076,7 +1115,7 @@ jobs:
           data = gzip.decompress(open(sys.argv[1], "rb").read())
           required = [
               b"bin/busybox", b"etc/inittab", b"etc/init.d/rcS",
-              b"etc/init.d/S30storage", b"usr/sbin/xwt-storage", b"usr/sbin/xwt-packs",
+              b"etc/init.d/S30storage", b"usr/sbin/xwt-storage", b"usr/sbin/xwt-packs", b"usr/sbin/xwt-doctor",
               b"usr/sbin/xwt-system-menu", b"usr/sbin/xwt-system-menu-text", b"dev/console",
           ]
           missing = [r.decode() for r in required if r not in data]
@@ -1097,6 +1136,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           LIMIT=$((32 * 1024 * 1024))
@@ -1124,6 +1164,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           KERNEL="$RUNNER_TEMP/buildroot-output/images/zImage.xenon"
 
@@ -1155,6 +1196,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           CACHE_ROOT="$HOME/.cache/xwt-cross-toolchain"
 
@@ -1196,6 +1238,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           # Use a local launcher if the user already has one in the repo.
           LOCAL_LAUNCHER=""
@@ -1291,6 +1334,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           python3 "$PROJECT_DIR/scripts/package_linux_usb.py" \
             --launcher "$RUNNER_TEMP/default.xex" \
@@ -1517,6 +1561,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
           cd "$RUNNER_TEMP/release-assets"
 
