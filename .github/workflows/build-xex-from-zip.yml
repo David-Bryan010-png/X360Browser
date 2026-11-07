@@ -21,6 +21,8 @@ env:
   FREE60_COMMIT: 3c3e76fb1ffa3bcce3a50a6af6b847a2da25139f
   XELL_LAUNCH2_COMMIT: d838b33a763c9ecb022d1a031950879b602e9165
   XELL_LAUNCH2_TAG: v2.2.0
+  XELL_RELOADED_COMMIT: b1bb00b51df8ec3da7aa18bafdd52b46a3306225
+  LIBXENON_COMMIT: 1334a0ff48c467974b84cdf5927352196cc33eab
   BR2_DL_DIR: /home/runner/.cache/xwt-buildroot-dl
   CCACHE_DIR: /home/runner/.cache/xwt-buildroot-ccache
   CCACHE_MAXSIZE: 1G
@@ -231,10 +233,15 @@ jobs:
               "scripts/test_split_rootfs.py",
               "scripts/test_xwt_game.py",
               "scripts/test_xwt_apps.py",
+              "scripts/test_xwt_persist.py",
+              "scripts/test_xwt_boot.py",
               "scripts/make_manifest.py",
               "scripts/test_source_manifest.py",
               "linux/overlay/usr/sbin/xwt-game",
               "linux/overlay/usr/sbin/xwt-apps",
+              "linux/overlay/usr/sbin/xwt-persist",
+              "linux/src/xwt-osk.c",
+              "boot/patch_xwt_boot.py",
               "linux/overlay/usr/sbin/xwt-doctor",
               "linux/overlay/etc/init.d/S90report",
               "scripts/split_rootfs.py",
@@ -415,6 +422,8 @@ jobs:
             test_split_rootfs \
             test_xwt_game \
             test_xwt_apps \
+            test_xwt_persist \
+            test_xwt_boot \
             test_source_manifest \
             test_xwt_audio_video \
             test_preflight \
@@ -548,6 +557,7 @@ jobs:
             '^CONFIG_INPUT_KEYBOARD=y$' \
             '^CONFIG_INPUT_JOYDEV=m$' \
             '^CONFIG_INPUT_UINPUT=m$' \
+            '^CONFIG_LEGACY_TIOCSTI=y$' \
             '^CONFIG_TMPFS=y$' \
             '^CONFIG_DEVTMPFS=y$' \
             '^CONFIG_VFAT_FS=y$' \
@@ -803,6 +813,7 @@ jobs:
             '^CONFIG_INPUT_KEYBOARD=y$' \
             '^CONFIG_INPUT_JOYDEV=m$' \
             '^CONFIG_INPUT_UINPUT=m$' \
+            '^CONFIG_LEGACY_TIOCSTI=y$' \
             '^CONFIG_SQUASHFS=y$' \
             '^CONFIG_OVERLAY_FS=y$' \
             '^CONFIG_BLK_DEV_LOOP=y$' \
@@ -931,6 +942,7 @@ jobs:
             '^CONFIG_INPUT_KEYBOARD=y$' \
             '^CONFIG_INPUT_JOYDEV=m$' \
             '^CONFIG_INPUT_UINPUT=m$' \
+            '^CONFIG_LEGACY_TIOCSTI=y$' \
             '^CONFIG_SQUASHFS=y$' \
             '^CONFIG_OVERLAY_FS=y$' \
             '^CONFIG_BLK_DEV_LOOP=y$' \
@@ -1046,6 +1058,8 @@ jobs:
               "usr/sbin/xwt-video-check",
               "usr/sbin/xwt-desktop",
               "usr/sbin/xwt-gamepad-keys",
+              "usr/sbin/xwt-osk",
+              "usr/sbin/xwt-persist",
               "usr/share/fonts/dejavu/DejaVuSans.ttf",
               "usr/bin/curl",
           }
@@ -1075,6 +1089,8 @@ jobs:
               "usr/sbin/xwt-video-check",
               "usr/sbin/xwt-desktop",
               "usr/sbin/xwt-gamepad-keys",
+              "usr/sbin/xwt-osk",
+              "usr/sbin/xwt-persist",
           }
 
           missing_exec = required_exec - executable
@@ -1234,6 +1250,38 @@ jobs:
             ~/.cache/xwt-buildroot-ccache
           key: ${{ runner.os }}-xwt-core-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v2
 
+      - name: "Build XWT Boot - separate boot ELF (xenon.elf) started by XeLL"
+        id: xwtboot
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::warning title=XWT Boot nao compilou::linha $LINENO: $BASH_COMMAND (o pacote sai no formato antigo: XeLL le o kboot.conf da raiz)"' ERR
+          BOOT_WORK="$RUNNER_TEMP/xwt-boot-work"
+          rm -rf "$BOOT_WORK"; mkdir -p "$BOOT_WORK" "$RUNNER_TEMP/xwt-boot-out"
+          git clone --quiet https://github.com/Free60Project/xell-reloaded.git "$BOOT_WORK/xell-reloaded"
+          git -C "$BOOT_WORK/xell-reloaded" checkout --quiet "$XELL_RELOADED_COMMIT"
+          git clone --quiet https://github.com/Free60Project/libxenon.git "$BOOT_WORK/libxenon"
+          git -C "$BOOT_WORK/libxenon" checkout --quiet "$LIBXENON_COMMIT"
+          python3 "$PROJECT_DIR/boot/patch_xwt_boot.py" "$BOOT_WORK/xell-reloaded" "$BOOT_WORK/libxenon"
+          docker run --rm -v "$BOOT_WORK:/work" -w /work free60/libxenon:latest bash -lc '
+            set -Eeuo pipefail
+            export DEVKITXENON="${DEVKITXENON:-/usr/local/xenon}"
+            export PATH="$PATH:$DEVKITXENON/bin:$DEVKITXENON/usr/bin"
+            make -C /work/libxenon/libxenon/ports/xenon clean
+            make -j"$(nproc)" -C /work/libxenon/libxenon/ports/xenon libxenon.a
+            make -C /work/libxenon/libxenon/ports/xenon install
+            cd /work/xell-reloaded
+            git config --global --add safe.directory /work/xell-reloaded
+            make -f Makefile_lv2.mk
+            xenon-strip stage2.elf32 -o xenon.elf || cp stage2.elf32 xenon.elf
+          '
+          test -s "$BOOT_WORK/xell-reloaded/xenon.elf"
+          head -c 4 "$BOOT_WORK/xell-reloaded/xenon.elf" | od -An -c | grep -q 'E   L   F'
+          cp "$BOOT_WORK/xell-reloaded/xenon.elf" "$RUNNER_TEMP/xwt-boot-out/xenon.elf"
+          echo "ok=1" >> "$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/xwt-boot-out"
+
       - name: Download pinned XellLaunch2 retail launcher
         shell: bash
         run: |
@@ -1336,12 +1384,15 @@ jobs:
           set -Eeuo pipefail
           trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
 
+          BOOT_ARGS=()
+          if [ "${{ steps.xwtboot.outputs.ok }}" = "1" ]; then BOOT_ARGS=(--boot-dir "$RUNNER_TEMP/xwt-boot-out"); fi
           python3 "$PROJECT_DIR/scripts/package_linux_usb.py" \
             --launcher "$RUNNER_TEMP/default.xex" \
             --launcher-license "$RUNNER_TEMP/XellLaunch2-LICENSE.txt" \
             --kernel "$RUNNER_TEMP/buildroot-output/images/zImage.xenon" \
             --initrd "$RUNNER_TEMP/buildroot-output/images/rootfs.cpio.gz" \
             --packs-dir "$RUNNER_TEMP/buildroot-output/images/xwt-split" \
+            "${BOOT_ARGS[@]}" \
             --project "$PROJECT_DIR" \
             --output "$RUNNER_TEMP/XWT-Linux-${XWT_VERSION}-USB.zip"
 
