@@ -1250,7 +1250,7 @@ jobs:
             ~/.cache/xwt-buildroot-ccache
           key: ${{ runner.os }}-xwt-core-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-cache-v2
 
-      - name: "Build XWT Boot - separate boot ELF (xenon.elf) started by XeLL"
+      - name: "Build XWT Boot - independent boot manager (own ELF + XellLaunch2 images)"
         id: xwtboot
         continue-on-error: true
         shell: bash
@@ -1259,11 +1259,13 @@ jobs:
           trap 'echo "::warning title=XWT Boot nao compilou::linha $LINENO: $BASH_COMMAND (o pacote sai no formato antigo: XeLL le o kboot.conf da raiz)"' ERR
           BOOT_WORK="$RUNNER_TEMP/xwt-boot-work"
           rm -rf "$BOOT_WORK"; mkdir -p "$BOOT_WORK" "$RUNNER_TEMP/xwt-boot-out"
-          git clone --quiet https://github.com/Free60Project/xell-reloaded.git "$BOOT_WORK/xell-reloaded"
-          git -C "$BOOT_WORK/xell-reloaded" checkout --quiet "$XELL_RELOADED_COMMIT"
           git clone --quiet https://github.com/Free60Project/libxenon.git "$BOOT_WORK/libxenon"
           git -C "$BOOT_WORK/libxenon" checkout --quiet "$LIBXENON_COMMIT"
-          python3 "$PROJECT_DIR/boot/patch_xwt_boot.py" "$BOOT_WORK/xell-reloaded" "$BOOT_WORK/libxenon"
+          # XeLL Reloaded is only used for its tiny stage-1 wrapper, so XellLaunch2 can start our ELF directly.
+          git clone --quiet https://github.com/Free60Project/xell-reloaded.git "$BOOT_WORK/xell-reloaded"
+          git -C "$BOOT_WORK/xell-reloaded" checkout --quiet "$XELL_RELOADED_COMMIT"
+          python3 "$PROJECT_DIR/boot/patch_xwt_boot.py" "$BOOT_WORK/libxenon"
+          cp -r "$PROJECT_DIR/boot/xwtboot" "$BOOT_WORK/xwtboot"
           docker run --rm -v "$BOOT_WORK:/work" -w /work free60/libxenon:latest bash -lc '
             set -Eeuo pipefail
             export DEVKITXENON="${DEVKITXENON:-/usr/local/xenon}"
@@ -1271,14 +1273,28 @@ jobs:
             make -C /work/libxenon/libxenon/ports/xenon clean
             make -j"$(nproc)" -C /work/libxenon/libxenon/ports/xenon libxenon.a
             make -C /work/libxenon/libxenon/ports/xenon install
+            make -C /work/xwtboot
+            test -s /work/xwtboot/xwtboot.elf32
             cd /work/xell-reloaded
             git config --global --add safe.directory /work/xell-reloaded
-            make -f Makefile_lv2.mk
-            xenon-strip stage2.elf32 -o xenon.elf || cp stage2.elf32 xenon.elf
+            make xell-1f.elf xell-2f.elf
+            cp /work/xwtboot/xwtboot.elf32 stage2.elf32
+            gzip -n9 -f stage2.elf32
+            test "$(stat -c %s stage2.elf32.gz)" -le 245744
+            for b in xell-1f xell-2f; do
+              xenon-objcopy -O binary $b.elf $b.bin
+              test "$(stat -c %s $b.bin)" -le 16384
+              truncate --size=262128 $b.bin
+              echo -n xxxxxxxxxxxxxxxx >> $b.bin
+              dd if=stage2.elf32.gz of=$b.bin conv=notrunc bs=16384 seek=1
+            done
           '
-          test -s "$BOOT_WORK/xell-reloaded/xenon.elf"
-          head -c 4 "$BOOT_WORK/xell-reloaded/xenon.elf" | od -An -c | grep -q 'E   L   F'
-          cp "$BOOT_WORK/xell-reloaded/xenon.elf" "$RUNNER_TEMP/xwt-boot-out/xenon.elf"
+          head -c 4 "$BOOT_WORK/xwtboot/xwtboot.elf32" | od -An -c | grep -q 'E   L   F'
+          cp "$BOOT_WORK/xwtboot/xwtboot.elf32" "$RUNNER_TEMP/xwt-boot-out/xenon.elf"
+          for b in xell-1f xell-2f; do
+            test "$(stat -c %s "$BOOT_WORK/xell-reloaded/$b.bin")" -eq 262144
+            cp "$BOOT_WORK/xell-reloaded/$b.bin" "$RUNNER_TEMP/xwt-boot-out/$b.bin"
+          done
           echo "ok=1" >> "$GITHUB_OUTPUT"
           ls -l "$RUNNER_TEMP/xwt-boot-out"
 
