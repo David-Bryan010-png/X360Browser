@@ -398,6 +398,17 @@ jobs:
             cp "$wf" "$PROJECT_DEST/.github/workflows/$(basename "$wf")"
           done
 
+          # ZIPs vindos do Windows/Drive perdem o bit de executavel: restaura nos scripts.
+          chmod +x "$PROJECT_DEST"/linux/post-build.sh 2>/dev/null || true
+          for d in linux/overlay/usr/sbin linux/overlay/usr/bin linux/overlay/etc/init.d \
+                   linux/overlay/etc/profile.d linux/overlay/etc/network linux/overlay/usr/libexec \
+                   scripts tools; do
+            [ -d "$PROJECT_DEST/$d" ] || continue
+            find "$PROJECT_DEST/$d" -type f ! -name '*.py' ! -name '*.md' ! -name '*.bmp' ! -name '*.png' ! -name '*.c' ! -name '*.h' ! -name '*.example' \
+              -exec chmod +x {} +
+            find "$PROJECT_DEST/$d" -type f -name '*.py' -exec chmod +x {} +
+          done
+
           echo "PROJECT_DIR=$PROJECT_DEST" >> "$GITHUB_ENV"
 
       - name: Run host package and safety tests
