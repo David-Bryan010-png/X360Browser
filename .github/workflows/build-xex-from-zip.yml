@@ -650,7 +650,8 @@ jobs:
             cat "$PROJECT_DIR/linux/browser.fragment" >> "$OUTPUT/.config"
           fi
           if [ "${{ inputs.with_x11 }}" = "true" ]; then
-            echo "X11 experimental (KDrive) ativado por with_x11."
+            echo "X11 experimental (Xorg modular + eudev) ativado por with_x11."
+            sed -i -e '/^BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_MDEV=y$/d' "$OUTPUT/.config"
             cat "$PROJECT_DIR/linux/x11.fragment" >> "$OUTPUT/.config"
             if [ "${{ inputs.with_gtk }}" = "true" ]; then
               echo "GTK3 + Mesa softpipe + pcmanfm ativados por with_gtk."
@@ -782,6 +783,26 @@ jobs:
             echo "Unexpected large package enabled in base image." >&2
             grep -E "$BIG_PATTERN" "$CONFIG" >&2
             exit 1
+          fi
+
+          if grep -Fqx 'BR2_LEGACY=y' "$CONFIG"; then
+            echo "Buildroot .config tem opcao LEGADA (removida do Buildroot). Simbolos legados ativos:" >&2
+            python3 - "$BUILDROOT_DIR/Config.in.legacy" "$CONFIG" >&2 <<'LEG'
+          import re, sys
+          legacy = set(re.findall(r"(?m)^config (BR2_[A-Z0-9_]+)", open(sys.argv[1]).read()))
+          for line in open(sys.argv[2]):
+              m = re.match(r"(BR2_[A-Z0-9_]+)=y$", line.strip())
+              if m and m.group(1) in legacy and m.group(1) != "BR2_LEGACY":
+                  print("  " + m.group(1))
+          LEG
+            exit 1
+          fi
+          if [ "$WITH_X11" = "true" ]; then
+            for sym in BR2_PACKAGE_XSERVER_XORG_SERVER_MODULAR BR2_PACKAGE_XDRIVER_XF86_INPUT_EVDEV \
+                       BR2_PACKAGE_XDRIVER_XF86_VIDEO_FBDEV BR2_PACKAGE_EUDEV BR2_PACKAGE_OPENBOX \
+                       BR2_PACKAGE_XTERM BR2_PACKAGE_XVKBD BR2_PACKAGE_XAPP_XINIT BR2_PACKAGE_FLTK; do
+              grep -Fqx "$sym=y" "$CONFIG" || { echo "Buildroot descartou opcao do X11: $sym" >&2; exit 1; }
+            done
           fi
 
           echo "Buildroot configuration validated."
