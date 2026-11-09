@@ -644,6 +644,7 @@ jobs:
             "$OUTPUT/.config"
 
           WITH_BROWSER="${{ inputs.with_browser }}"
+          WITH_X11="${{ inputs.with_x11 }}"
           if [ "$WITH_BROWSER" = "true" ]; then
             echo "Navegador NetSurf (SDL) + links ativados por with_browser."
             cat "$PROJECT_DIR/linux/browser.fragment" >> "$OUTPUT/.config"
@@ -772,14 +773,14 @@ jobs:
             }
           done
 
-          if grep -Eq \
-            '^BR2_PACKAGE_(NETSURF|PYTHON3)=' \
-            "$CONFIG"; then
-
+          # Base sem opcionais nao pode ter pacotes grandes; NetSurf so e aceito com with_browser.
+          BIG_PATTERN='^BR2_PACKAGE_PYTHON3='
+          if [ "$WITH_BROWSER" != "true" ]; then
+            BIG_PATTERN='^BR2_PACKAGE_(NETSURF|PYTHON3)='
+          fi
+          if [ "$WITH_X11" != "true" ] && grep -Eq "$BIG_PATTERN" "$CONFIG"; then
             echo "Unexpected large package enabled in base image." >&2
-            grep -E \
-              '^BR2_PACKAGE_(NETSURF|PYTHON3)=' \
-              "$CONFIG" >&2
+            grep -E "$BIG_PATTERN" "$CONFIG" >&2
             exit 1
           fi
 
