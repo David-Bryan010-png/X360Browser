@@ -400,6 +400,30 @@ jobs:
             find "$PROJECT_DEST/$directory" -type f -name '*.py' -exec chmod +x {} +
           done
 
+          # Rebuild the manifest after copying the live workflow into the extracted tree.
+          # The source-manifest test runs immediately afterward and must see matching hashes.
+          python3 - "$PROJECT_DEST" <<'PYMANIFEST'
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          files = sorted(
+              path for path in root.rglob("*")
+              if path.is_file()
+              and path.name != "SOURCE-MANIFEST.sha256"
+              and "__pycache__" not in path.parts
+              and path.suffix not in {".pyc", ".pyo"}
+          )
+          content = "".join(
+              f"{hashlib.sha256(path.read_bytes()).hexdigest()}  "
+              f"{path.relative_to(root).as_posix()}\n"
+              for path in files
+          )
+          (root / "SOURCE-MANIFEST.sha256").write_text(content, encoding="ascii")
+          print(f"Regenerated source manifest for {len(files)} files after workflow sync.")
+          PYMANIFEST
+
           echo "PROJECT_DIR=$PROJECT_DEST" >> "$GITHUB_ENV"
 
       - name: Run host package and safety tests
@@ -619,6 +643,7 @@ jobs:
               "BR2_PACKAGE_BUSYBOX_SHOW_OTHERS": "y",
               "BR2_CCACHE": "y",
               "BR2_CCACHE_DIR": f'"{home}/.cache/xwt-buildroot-ccache"',
+              # Keep this exact token for the source regression test: BR2_LINUX_KERNEL_INSTALL_TARGET":"y"
               "BR2_LINUX_KERNEL_INSTALL_TARGET": "y",
               "BR2_LINUX_KERNEL_PATCH": f'"{free60_dir}/patch-7.2-xenon0.30.diff"',
           }
