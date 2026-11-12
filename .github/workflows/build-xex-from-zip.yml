@@ -1214,11 +1214,20 @@ jobs:
           test -x "$OUTPUT/target/usr/games/prboom" || { echo "ERROR: PrBoom (Doom) missing from rootfs" >&2; exit 1; }
           cp "$OUTPUT/images/rootfs.cpio.gz" "$OUTPUT/images/rootfs-full.cpio.gz"
           rm -rf "$OUTPUT/images/xwt-split"
-          python3 "$PROJECT_DIR/scripts/split_rootfs.py" \
-            --target "$OUTPUT/target" \
-            --rules "$PROJECT_DIR/linux/packs.rules" \
-            --outdir "$OUTPUT/images/xwt-split" \
-            --max-pack-mib 28
+          SPLIT_LOG="$RUNNER_TEMP/split-rootfs.log"
+          if ! python3 "$PROJECT_DIR/scripts/split_rootfs.py" \
+              --target "$OUTPUT/target" \
+              --rules "$PROJECT_DIR/linux/packs.rules" \
+              --outdir "$OUTPUT/images/xwt-split" \
+              --max-pack-mib 28 >"$SPLIT_LOG" 2>&1; then
+            SPLIT_TAIL="$(tail -n 25 "$SPLIT_LOG")"
+            SPLIT_TAIL="${SPLIT_TAIL//'%'/'%25'}"
+            SPLIT_TAIL="${SPLIT_TAIL//$'\n'/'%0A'}"
+            echo "::error title=split_rootfs falhou::${SPLIT_TAIL}"
+            cat "$SPLIT_LOG" >&2
+            exit 1
+          fi
+          cat "$SPLIT_LOG" | tail -n 40
 
           # Stage 1 is what XeLL loads: it must still boot to the point of mounting the packs.
           python3 - "$OUTPUT/images/xwt-split/rootfs.cpio.gz" <<'PY'
@@ -1263,7 +1272,7 @@ jobs:
             echo ''
             echo 'Maiores diretorios do rootfs (KiB):'
             echo '```'
-            du -x -k -d 3 "$OUTPUT/target" 2>/dev/null | sort -rn | head -n 15
+            du -x -k -d 3 "$OUTPUT/target" 2>/dev/null | sort -rn | head -n 15 || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -1305,6 +1314,7 @@ jobs:
           PY
 
       - name: Save cross-toolchain cache for future native modules
+        continue-on-error: true
         if: success()
         shell: bash
         run: |
@@ -1332,6 +1342,7 @@ jobs:
           du -sh "$CACHE_ROOT"
 
       - name: Persist cross-toolchain cache
+        continue-on-error: true
         if: success()
         uses: actions/cache/save@v6
         with:
@@ -1339,6 +1350,7 @@ jobs:
           key: ${{ runner.os }}-xwt-cross-${{ env.BUILDROOT_COMMIT }}-${{ env.FREE60_COMMIT }}-desktop-core-v2
 
       - name: Save Buildroot caches
+        continue-on-error: true
         if: ${{ always() && steps.build-cache.outcome == 'success' && steps.build-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
@@ -1670,6 +1682,7 @@ jobs:
             ${{ runner.temp }}/buildroot-output/.config
             ${{ runner.temp }}/buildroot-configure.log
             ${{ runner.temp }}/linux-configure.log
+            ${{ runner.temp }}/split-rootfs.log
             ${{ runner.temp }}/buildroot-build.log
             ${{ runner.temp }}/free60-commit.txt
             ${{ runner.temp }}/buildroot-commit.txt
