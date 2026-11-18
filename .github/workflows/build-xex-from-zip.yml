@@ -412,6 +412,11 @@ jobs:
           )
           PY
 
+          # O workflow sobrescreve .github/ com os arquivos do repo (que mudam a cada versao):
+          # a integridade ja foi validada acima, entao tira essas linhas do manifesto de testes.
+          grep -v -E '^[0-9a-f]{64}  \.github/' "$PROJECT_DEST/SOURCE-MANIFEST.sha256" > "$RUNNER_TEMP/manifest.tmp" || true
+          cp "$RUNNER_TEMP/manifest.tmp" "$PROJECT_DEST/SOURCE-MANIFEST.sha256"
+
           mkdir -p "$PROJECT_DEST/.github/workflows"
 
           # Copia o(s) workflow(s) do repo sem depender do nome exato do arquivo.
