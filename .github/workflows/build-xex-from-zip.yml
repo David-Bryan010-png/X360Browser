@@ -296,6 +296,13 @@ jobs:
 
               total_size = 0
 
+              # Aceita zip com uma pasta unica na frente (ex.: XWT-Linux-source/VERSION).
+              tops = {PurePosixPath(n).parts[0] for n in names if PurePosixPath(n).parts}
+              strip = 0
+              if "VERSION" not in names and len(tops) == 1 and (list(tops)[0] + "/VERSION") in names:
+                  strip = 1
+                  print("Zip com pasta raiz '" + list(tops)[0] + "': removendo o prefixo.")
+
               for info in infos:
                   name = info.filename
                   path = PurePosixPath(name)
@@ -321,7 +328,9 @@ jobs:
                   if info.is_dir():
                       continue
 
-                  target = destination.joinpath(*path.parts)
+                  if len(path.parts) <= strip:
+                      continue
+                  target = destination.joinpath(*path.parts[strip:])
                   target.parent.mkdir(parents=True, exist_ok=True)
 
                   with archive.open(info) as source, target.open("wb") as output:
