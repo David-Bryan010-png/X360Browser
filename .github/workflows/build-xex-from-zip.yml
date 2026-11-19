@@ -695,6 +695,11 @@ jobs:
               "BR2_CCACHE_DIR":
                   f'"{home}/.cache/xwt-buildroot-ccache"',
               "BR2_LINUX_KERNEL_INSTALL_TARGET":"y",
+              # O Xenon nao executa AltiVec padrao (so VMX128): -mcpu=970 gerava vxor etc. no ld.so
+              # e o init morria com "illegal instruction". power4 = mesmo ISA 64-bit, sem vetor.
+              "BR2_powerpc_970": "n",
+              "BR2_powerpc_power4": "y",
+              "BR2_TARGET_OPTIMIZATION": '"-mno-altivec -mno-vsx"',
               "BR2_LINUX_KERNEL_PATCH":
                   f'"{free60_dir}/patch-7.2-xenon0.30.diff"',
           }
@@ -727,7 +732,10 @@ jobs:
           }
 
           require 'BR2_powerpc64=y'
-          require 'BR2_powerpc_970=y'
+          require 'BR2_powerpc_power4=y'
+          if grep -q '^BR2_POWERPC_CPU_HAS_ALTIVEC=y' "$CONFIG"; then
+            echo "::error title=AltiVec ativo::o Xenon nao executa AltiVec padrao" >&2; exit 1
+          fi
           require 'BR2_INIT_BUSYBOX=y'
           require 'BR2_KERNEL_HEADERS_7_2=y'
           require 'BR2_TOOLCHAIN_BUILDROOT=y'
@@ -1225,6 +1233,25 @@ jobs:
 
           OUTPUT="$RUNNER_TEMP/buildroot-output"
           command -v mksquashfs
+
+          # Guarda: o Xenon nao executa AltiVec padrao. Procura instrucoes vetoriais nos binarios essenciais.
+          OBJDUMP="$(ls "$OUTPUT"/host/bin/*-objdump 2>/dev/null | head -n 1 || true)"
+          if [ -n "$OBJDUMP" ]; then
+            BAD=0
+            for f in "$OUTPUT"/target/lib/ld*.so* "$OUTPUT"/target/lib/libc.so.6 "$OUTPUT"/target/lib64/ld*.so* \
+                     "$OUTPUT"/target/bin/busybox "$OUTPUT"/target/usr/lib/libc.so.6; do
+              [ -f "$f" ] || continue
+              N="$("$OBJDUMP" -d "$f" 2>/dev/null | grep -cE '[[:space:]](v[a-z0-9_]+|lvx|stvx|lvsl|lvsr|mfvscr|mtvscr)[[:space:]]' || true)"
+              if [ "${N:-0}" -gt 0 ]; then
+                echo "::error title=Instrucao AltiVec em $(basename "$f")::$N instrucoes vetoriais; o Xbox 360 daria illegal instruction"
+                BAD=1
+              fi
+            done
+            [ "$BAD" = 0 ] || exit 1
+            echo "Sem instrucoes AltiVec em ld.so/libc/busybox."
+          else
+            echo "objdump do toolchain nao encontrado: pulando a checagem AltiVec."
+          fi
           test -x "$OUTPUT/target/usr/games/prboom" || { echo "ERROR: PrBoom (Doom) missing from rootfs" >&2; exit 1; }
           cp "$OUTPUT/images/rootfs.cpio.gz" "$OUTPUT/images/rootfs-full.cpio.gz"
           rm -rf "$OUTPUT/images/xwt-split"
