@@ -1,3 +1,3 @@
-# X360Browser
+# XWT Linux 
 
-projeto de um navegador para xbox 360!
+Projeto de um Linux para Xbox 360.
