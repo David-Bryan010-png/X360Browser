@@ -640,6 +640,136 @@ jobs:
           git -C "$BUILDROOT_DIR" rev-parse HEAD \
             > "$RUNNER_TEMP/buildroot-commit.txt"
 
+      - name: Install XWT video guard (desktop with automatic text fallback)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
+          DEST="$PROJECT_DIR/linux/overlay/usr/sbin/xwt-system-menu"
+          cat > "$DEST" <<'GFXEOF'
+          #!/bin/sh
+          # XWT: inicia o desktop grafico com protecao contra tela preta.
+          # Se o desktop nao for confirmado (ficou preto e o usuario reiniciou), o proximo boot cai
+          # automaticamente no menu de texto (console fbcon, que funciona no Xenos).
+          mkdir -p /run
+          [ -r /etc/profile.d/xwt-tz.sh ] && . /etc/profile.d/xwt-tz.sh
+          LOG=/run/xwt-desktop.log
+          USB=/mnt/xwt-usb
+          CFG=$USB/xwt/config
+          LOGS=$USB/xwt/logs
+          TRY=$CFG/gfx-trying
+          MODE=$CFG/gfx-mode
+          CMD=$(cat /proc/cmdline 2>/dev/null)
+
+          say() { echo "[xwt-gfx] $*" >>"$LOG"; }
+
+          restore_console() {
+            # Devolve o console de texto: sai do modo grafico, desliga o apagar-tela e mostra o cursor.
+            for t in /dev/tty0 /dev/console; do
+              [ -w "$t" ] || continue
+              { printf '\033c\033[9;0]\033[13]\033[?25h' >"$t"; } 2>/dev/null
+              break
+            done
+            { echo 0 >/sys/module/kernel/parameters/consoleblank; } 2>/dev/null || true
+          }
+
+          text_menu() {
+            restore_console
+            exec /usr/sbin/xwt-system-menu-text
+          }
+
+          save_logs() {
+            [ -d "$LOGS" ] || return 0
+            cp "$LOG" "$LOGS/desktop-last.log" 2>/dev/null
+            [ -f /run/xwt-video-report.txt ] && cp /run/xwt-video-report.txt "$LOGS/video-report.txt" 2>/dev/null
+            { echo "== /proc/fb"; cat /proc/fb 2>&1; echo "== fb0"; for f in name virtual_size bits_per_pixel stride; do echo "$f: $(cat /sys/class/graphics/fb0/$f 2>&1)"; done
+              echo "== desktop pid"; ps 2>/dev/null | grep -i xwt-desktop | grep -v grep
+              echo "== dmesg"; dmesg 2>/dev/null | tail -n 150; } >"$LOGS/video-dmesg.txt" 2>&1
+            sync
+          }
+
+          if echo "$CMD" | grep -qF 'xwt.text=1'; then text_menu; fi
+
+          [ -r /run/xwt-packs.env ] && . /run/xwt-packs.env
+          if [ "${XWT_PACKS:-ok}" = missing ]; then
+            say "packs ausentes (veja /run/xwt-packs.log); usando menu de texto"
+            text_menu
+          fi
+
+          FORCE=0
+          echo "$CMD" | grep -qF 'xwt.gfx=force' && FORCE=1
+
+          if [ -d "$CFG" ] && [ "$FORCE" = 0 ]; then
+            if [ -f "$TRY" ]; then
+              say "tentativa anterior do desktop nao foi confirmada (tela preta?); desativando o desktop"
+              echo text >"$MODE"; rm -f "$TRY"; sync
+            fi
+            if [ -f "$MODE" ] && grep -q text "$MODE" 2>/dev/null; then
+              restore_console
+              echo
+              echo "XWT: desktop grafico desativado porque o boot anterior ficou sem imagem."
+              echo "Para tentar de novo: rm /mnt/xwt-usb/xwt/config/gfx-mode  (ou boot 'xwt_gfx' no XeLL)."
+              echo "Log: /mnt/xwt-usb/xwt/logs/desktop-last.log e video-dmesg.txt"
+              echo
+              sleep 3
+              text_menu
+            fi
+          fi
+          [ "$FORCE" = 1 ] && rm -f "$MODE" 2>/dev/null
+
+          if [ -x /usr/sbin/xwt-desktop ]; then
+            [ -d "$CFG" ] && { date >"$TRY" 2>/dev/null || echo 1 >"$TRY"; sync; }
+            say "iniciando xwt-desktop (SDL fbcon /dev/fb0)"
+            /usr/sbin/xwt-desktop >>"$LOG" 2>&1 &
+            DPID=$!
+            (
+              sleep 15; save_logs
+              sleep 45; save_logs
+              sleep 120
+              # Vivo por ~3 min: considera o desktop confirmado.
+              if kill -0 "$DPID" 2>/dev/null; then rm -f "$TRY"; sync; fi
+            ) &
+            wait "$DPID"
+            result=$?
+            say "xwt-desktop terminou com status $result; voltando ao menu de texto"
+            rm -f "$TRY"
+            save_logs
+            text_menu
+          fi
+          text_menu
+          GFXEOF
+          chmod +x "$DEST"
+          sh -n "$DEST"
+
+          # kboot.conf: nunca apagar a tela do console e uma entrada para forcar o desktop.
+          python3 - "$PROJECT_DIR/linux/boot/kboot.conf" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          lines = path.read_text().splitlines()
+          out = []
+          base = None
+          for line in lines:
+              m = re.match(r'^(xwt[A-Za-z0-9_]*)="(.*)"$', line)
+              if m and "consoleblank=0" not in line:
+                  line = f'{m.group(1)}="{m.group(2)} consoleblank=0"'
+              m = re.match(r'^xwt="(.*)"$', line)
+              if m:
+                  base = m.group(1)
+              out.append(line)
+          if base and not any(l.startswith("xwt_gfx=") for l in out):
+              entry = f'xwt_gfx="{base} xwt.gfx=force"'
+              idx = max(i for i, l in enumerate(out) if re.match(r'^xwt[A-Za-z0-9_]*="', l))
+              out.insert(idx + 1, entry)
+          for l in out:
+              if re.match(r'^[A-Za-z0-9_]+="', l) and len(l) > 255:
+                  raise SystemExit("kboot entry too long (>255): " + l[:60])
+          path.write_text("\n".join(out) + "\n")
+          print(path.read_text())
+          PY
+
       - name: Configure Buildroot for the 1.0.0 desktop system
         shell: bash
         run: |
