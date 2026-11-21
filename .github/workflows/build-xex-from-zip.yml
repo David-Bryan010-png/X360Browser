@@ -1434,6 +1434,8 @@ jobs:
 
       - name: Download pinned XellLaunch2 retail launcher
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           trap 'echo "::error title=Falha no passo::linha $LINENO: $BASH_COMMAND"' ERR
@@ -1469,18 +1471,23 @@ jobs:
 
           API="https://api.github.com/repos/mitchellwaite/XellLaunch2/releases/tags/${XELL_LAUNCH2_TAG}"
 
-          curl \
-            --fail \
-            --location \
-            --silent \
-            --show-error \
-            -H 'Accept: application/vnd.github+json' \
-            "$API" \
-            -o "$RUNNER_TEMP/xell-release.json"
+          # API autenticada com retries (a chamada anonima falha com HTTP 403 por limite de taxa).
+          GOT_API=0
+          for attempt in 1 2 3 4; do
+            if curl --fail --location --silent --show-error \
+                 -H 'Accept: application/vnd.github+json' \
+                 -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+                 "$API" -o "$RUNNER_TEMP/xell-release.json"; then
+              GOT_API=1; break
+            fi
+            echo "Tentativa $attempt da API de releases falhou; aguardando..."
+            sleep $((attempt * 5))
+          done
 
-          python3 - \
-            "$RUNNER_TEMP/xell-release.json" \
-            "$RUNNER_TEMP/xell-url.txt" <<'PY'
+          if [ "$GOT_API" = "1" ]; then
+            python3 - \
+              "$RUNNER_TEMP/xell-release.json" \
+              "$RUNNER_TEMP/xell-url.txt" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -1508,6 +1515,26 @@ jobs:
 
           print("Selected launcher:", candidates[0]["name"])
           PY
+          else
+            echo "API indisponivel: lendo a pagina publica de assets da release."
+            curl --fail --location --silent --show-error \
+              "https://github.com/mitchellwaite/XellLaunch2/releases/expanded_assets/${XELL_LAUNCH2_TAG}" \
+              -o "$RUNNER_TEMP/xell-assets.html"
+            python3 - "$RUNNER_TEMP/xell-assets.html" "$RUNNER_TEMP/xell-url.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          html = Path(sys.argv[1]).read_text(errors="replace")
+          links = sorted(set(re.findall(r'href="(/mitchellwaite/XellLaunch2/releases/download/[^"]+\.xex)"', html, re.I)))
+          retail = [l for l in links if "retail" in l.lower()]
+          pick = retail if len(retail) == 1 else links if len(links) == 1 else []
+          if len(pick) != 1:
+              raise SystemExit("Could not identify the launcher XEX on the release page: " + ", ".join(links))
+          Path(sys.argv[2]).write_text("https://github.com" + pick[0] + "\n")
+          print("Selected launcher (page):", pick[0])
+          PY
+          fi
 
           curl \
             --fail \
