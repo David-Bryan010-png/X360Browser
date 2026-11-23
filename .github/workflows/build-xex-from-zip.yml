@@ -719,19 +719,49 @@ jobs:
 
           if [ -x /usr/sbin/xwt-desktop ]; then
             [ -d "$CFG" ] && { date >"$TRY" 2>/dev/null || echo 1 >"$TRY"; sync; }
+            # Se o desktop morrer (SIGILL etc.), o kernel registra o endereco e a biblioteca no dmesg.
+            { echo 1 >/proc/sys/debug/exception-trace; } 2>/dev/null
+            { echo 1 >/proc/sys/kernel/print-fatal-signals; } 2>/dev/null
+            rm -f /run/xwt-desktop.rc
             say "iniciando xwt-desktop (SDL fbcon /dev/fb0)"
-            /usr/sbin/xwt-desktop >>"$LOG" 2>&1 &
-            DPID=$!
-            (
-              sleep 15; save_logs
-              sleep 45; save_logs
-              sleep 120
-              # Vivo por ~3 min: considera o desktop confirmado.
-              if kill -0 "$DPID" 2>/dev/null; then rm -f "$TRY"; sync; fi
-            ) &
-            wait "$DPID"
-            result=$?
+            VTNUM=7
+            T0=$(date +%s)
+            if command -v openvt >/dev/null 2>&1 && command -v chvt >/dev/null 2>&1; then
+              # O desktop roda em outro terminal virtual: se ele morrer em modo grafico, voltamos ao tty1
+              # (texto) e a tela nao fica preta.
+              say "desktop em tty$VTNUM (openvt)"
+              (
+                sleep 15; save_logs
+                sleep 45; save_logs
+                sleep 120
+                if [ ! -f /run/xwt-desktop.rc ]; then rm -f "$TRY"; sync; fi
+              ) &
+              openvt -c "$VTNUM" -s -w -f -- /bin/sh -c '/usr/sbin/xwt-desktop >>/run/xwt-desktop.log 2>&1; echo $? >/run/xwt-desktop.rc'
+              result=$(cat /run/xwt-desktop.rc 2>/dev/null || echo 255)
+              chvt 1 2>/dev/null
+              deallocvt 2>/dev/null
+              # Falha de inicializacao rapida (ex.: SDL nao abriu o tty7): tenta uma vez direto no tty1.
+              if [ "$result" = 1 ] && [ $(( $(date +%s) - T0 )) -lt 12 ]; then
+                say "desktop falhou ao iniciar no tty$VTNUM (status 1); tentando direto no tty1"
+                restore_console
+                rm -f /run/xwt-desktop.rc
+                /usr/sbin/xwt-desktop >>"$LOG" 2>&1
+                result=$?
+              fi
+            else
+              /usr/sbin/xwt-desktop >>"$LOG" 2>&1 &
+              DPID=$!
+              (
+                sleep 15; save_logs
+                sleep 45; save_logs
+                sleep 120
+                if kill -0 "$DPID" 2>/dev/null; then rm -f "$TRY"; sync; fi
+              ) &
+              wait "$DPID"
+              result=$?
+            fi
             say "xwt-desktop terminou com status $result; voltando ao menu de texto"
+            dmesg 2>/dev/null | grep -iE 'illegal instruction|unhandled signal|fatal signal|xwt-desktop' | tail -n 10 >>"$LOG" 2>&1
             rm -f "$TRY"
             save_logs
             text_menu
@@ -740,6 +770,26 @@ jobs:
           GFXEOF
           chmod +x "$DEST"
           sh -n "$DEST"
+
+          # SDL 1.2: o configure liga -maltivec em TODA a libSDL por padrao (EXTRA_CFLAGS). O Xenon nao
+          # executa AltiVec padrao, entao o xwt-desktop morria com SIGILL (status 132). Desliga.
+          SDLMK="$BUILDROOT_DIR/package/sdl/sdl.mk"
+          test -f "$SDLMK"
+          if ! grep -q 'disable-altivec' "$SDLMK"; then
+            python3 - "$SDLMK" <<'PY'
+          import sys
+          from pathlib import Path
+
+          p = Path(sys.argv[1])
+          t = p.read_text()
+          marker = "SDL_CONF_OPTS += \\\n"
+          if t.count(marker) < 1:
+              raise SystemExit("sdl.mk: marker SDL_CONF_OPTS not found")
+          t = t.replace(marker, "SDL_CONF_OPTS += --disable-altivec\n" + marker, 1)
+          p.write_text(t)
+          PY
+          fi
+          grep -n 'disable-altivec' "$SDLMK"
 
           # kboot.conf: nunca apagar a tela do console e uma entrada para forcar o desktop.
           python3 - "$PROJECT_DIR/linux/boot/kboot.conf" <<'PY'
@@ -1378,6 +1428,28 @@ jobs:
                 echo "::warning title=Vetorial em $(basename "$f")::$N instrucoes (variantes selecionadas por HWCAP; o Xenon nao anuncia AltiVec)"
               fi
             done
+            # Bibliotecas do desktop nao tem variantes escolhidas por HWCAP: qualquer instrucao vetorial e fatal.
+            for f in "$OUTPUT"/target/usr/lib/libSDL*.so* "$OUTPUT"/target/usr/sbin/xwt-desktop \
+                     "$OUTPUT"/target/usr/sbin/xwt-osk "$OUTPUT"/target/usr/lib/libfreetype.so* "$OUTPUT"/target/usr/lib/libpng*.so*; do
+              [ -f "$f" ] || continue
+              N="$("$OBJDUMP" -d "$f" 2>/dev/null | grep -cE '[[:space:]](v[a-z0-9_]+|lvx|stvx|lvsl|lvsr|mfvscr|mtvscr)[[:space:]]' || true)"
+              if [ "${N:-0}" -gt 0 ]; then
+                echo "::error title=AltiVec incondicional em $(basename "$f")::$N instrucoes vetoriais; o desktop morreria com SIGILL no Xbox 360"
+                BAD=1
+              fi
+            done
+            # Resumo informativo: outros binarios/bibliotecas com instrucoes vetoriais (podem ser variantes por HWCAP).
+            SCAN="$RUNNER_TEMP/altivec-scan.txt"; : > "$SCAN"
+            while IFS= read -r f; do
+              case "$(basename "$f")" in ld*.so*|libc.so*|libc-*.so|libm.so*|libm-*.so|libpthread*|busybox|libSDL*|xwt-desktop|xwt-osk|libfreetype*|libpng*) continue ;; esac
+              [ "$(head -c 4 "$f" 2>/dev/null | od -An -c | tr -d ' ')" = '177ELF' ] || continue
+              N="$(timeout 120 "$OBJDUMP" -d "$f" 2>/dev/null | grep -cE '[[:space:]](v[a-z0-9_]+|lvx|stvx|lvsl|lvsr|mfvscr|mtvscr)[[:space:]]' || true)"
+              if [ "${N:-0}" -gt 0 ]; then echo "$N ${f#"$OUTPUT"/target/}" >> "$SCAN"; fi
+            done < <(find "$OUTPUT"/target/usr/lib "$OUTPUT"/target/lib "$OUTPUT"/target/usr/bin "$OUTPUT"/target/usr/sbin "$OUTPUT"/target/usr/games -type f -size -8M 2>/dev/null)
+            if [ -s "$SCAN" ]; then
+              sort -rn "$SCAN" | head -n 25
+              echo "::warning title=Outros arquivos com instrucoes vetoriais::$(sort -rn "$SCAN" | head -n 8 | tr '\n' ';')"
+            fi
             [ "$BAD" = 0 ] || exit 1
             echo "Sem instrucoes AltiVec em ld.so/libc/busybox."
           else
